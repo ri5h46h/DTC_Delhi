@@ -220,10 +220,14 @@ class Assign:
 
 
 class Fleet:
+    def age(self, b):
+        return max(0.0, time.time() - b.ts)
+
     def __init__(self, static):
         self.static = static
         self.buses, self.by_route, self.rows = {}, {}, []
         self.snap, self.last_ok, self.last_err, self.header_ts = 0, None, None, None
+        self.bad_snaps = 0                 # empty / suspiciously short feed answers that were ignored
 
     def update(self, rows, header_ts=None):
         now = time.time()
@@ -317,7 +321,7 @@ class Fleet:
                 rem = max(0.0, target - prog)
                 v, src = self.speed(b)
                 between = int(np.searchsorted(pat.cum, target) - np.searchsorted(pat.cum, prog))
-                eta = rem / v + DWELL_S * max(0, between - 1)
+                eta = max(0.0, rem / v + DWELL_S * max(0, between - 1) - self.age(b))   # bus moved since its last ping
                 rows.append({"bus": b, "route": self.static.label(pat.route_id), "to": pat.headsign,
                              "eta_s": eta, "dist": rem, "speed": v * 3.6, "src": src, "conf": "dir?" if a.conf == "guess" else a.conf})
         rows.sort(key=lambda r: r["eta_s"])
@@ -667,6 +671,7 @@ class App:
         f = self.fleet
         age = "-" if not f.last_ok else f"{time.time() - f.last_ok:.0f}s"
         txt = f" Delhi Live Bus Explorer | buses {len(f.buses)} | updated {age} ago | zoom {ZOOMS[self.z]} m/col"
+        if f.bad_snaps: txt += f" | empty feeds ignored: {f.bad_snaps}"
         if self.route: txt += f" | route {self.static.label(self.route)}"
         txt += extra
         scr.put(0, 0, txt.ljust(W), "hdr")
@@ -787,7 +792,7 @@ class App:
             e = "due" if eta < 45 else f"{eta / 60:.0f} min"
             line = f"{r['route']:<8}{str(r['to'])[:28]:<30}{e:>8}{r['dist']:>8.0f}m{r['speed']:>6.0f}km  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}"
             scr.put(6 + i, 1, line, "rev" if i == self.board_i else self.style_for(r["route"]))
-        scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop. This is the simple baseline your AI models must beat.", "dim")
+        scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
         self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | f refresh | Esc back")
 
     def draw_search(self, scr, H, W):
@@ -879,8 +884,16 @@ def fetch_loop(source, fleet, app, interval):
     while not app.quit:
         try:
             rows, hts = source.fetch()
-            fleet.update(rows, hts)
-            app.msg = ""
+            prev = len(fleet.rows)
+            if not rows or (prev >= 200 and len(rows) < 0.2 * prev):
+                # The server sometimes answers with an empty or tiny file. Keep the last good data
+                # instead of wiping the map (this was the "0 buses" blank screen).
+                fleet.bad_snaps += 1
+                fleet.last_ok = fleet.last_ok or time.time()
+                app.msg = f"Feed sent only {len(rows)} vehicles (before: {prev}). Kept the old data."
+            else:
+                fleet.update(rows, hts)
+                app.msg = ""
         except Exception as e:
             fleet.last_err = f"{type(e).__name__}: {e}"[:200]
         app.force.wait(timeout=max(10, interval))

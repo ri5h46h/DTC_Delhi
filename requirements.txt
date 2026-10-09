@@ -1,0 +1,5 @@
+gtfs-realtime-bindings
+requests
+pandas
+numpy
+windows-curses; sys_platform == "win32"

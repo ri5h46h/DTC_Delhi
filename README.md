@@ -1,13 +1,22 @@
-# Delhi Live Bus Explorer (terminal app)
+# Delhi Live Bus Explorer TUI App (terminal app)
 
 ## Setup
-    python -m venv .venv
-    .venv\Scripts\activate        (Windows)   or   source .venv/bin/activate   (Linux/Mac)
-    pip install -r requirements.txt
-1. Open `delhi_bus_tui.py` and paste your key into `API_KEY = "PASTE_YOUR_API_KEY_HERE"`.
+
+    Install UV first (https://docs.astral.sh/uv/)
+    uv python install 3.10
+    uv init
+    uv add -r requirements.txt
+    uv run delhi_bus_tui.py
+
+    or if not uv, then you can just use the basic inbuilt python-venv for creating a venv and then installing the requirements.
+
+1. Open `.env.example` file and paste your key into `API_KEY = "<paste your Dehi OTD API Key here>"
+`. And also rename it to `.env`
+
 2. Put your GTFS files (routes, trips, stops, stop_times .txt) in a folder called `gtfs` next to the script.
-3. Run `python delhi_bus_tui.py`  (first run indexes stop_times.txt and saves a cache; later runs start fast).
-Try without key/files: `python delhi_bus_tui.py --demo`
+
+3. Run `delhi_bus_tui.py`  (first run indexes stop_times.txt and saves a cache; later runs start fast).
+Try without key/files: `delhi_bus_tui.py --demo`
 
 ## Keys
 arrows pan | + / - zoom | b select bus | Enter all fields | s stop board | S board of bus's next stop

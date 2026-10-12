@@ -11,3 +11,17 @@ venv/
 # IDE settings
 .vscode/
 .idea/
+
+# ignoring the /data dir
+
+/data/*
+!/data/.gitkeep
+!/data/clean/
+/data/clean/*
+!/data/clean/.gitkeep
+!/data/raw/
+/data/raw/*
+!/data/raw/.gitkeep
+!/data/health/
+/data/health/*
+!/data/health/.gitkeep

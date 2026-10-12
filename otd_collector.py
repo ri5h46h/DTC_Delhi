@@ -15,7 +15,7 @@ Commands:
    python otd_collector.py run --demo       fake feed, no API key needed (to learn how it works)
    python otd_collector.py inspect          summary of the data collected so far
 """
-import argparse, csv, curses, gzip, math, os, random, sys, threading, time
+import argparse, csv, curses, gzip, math, os, random, re, sys, threading, time
 from collections import Counter, deque
 from pathlib import Path
 import os
@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================ CONFIG (edit these) ============================
-API_KEY = os.getenv("API_KEY")    # <-- paste your OTD key (or set env var OTD_API_KEY)
+API_KEY = os.getenv("API_KEY")     # <-- paste your OTD key (or set env var OTD_API_KEY)
 GTFS_DIR = "gtfs"                       # optional: routes.txt + trips.txt, used only to flag ID matches
 DATA_DIR = "data"
 BASE_URL = "https://otd.delhi.gov.in"
@@ -61,6 +61,11 @@ EXPLAIN = {
 
 class FeedError(Exception):
     pass
+
+
+def redact(text):
+    """Remove the API key from any error text before it is shown or saved."""
+    return re.sub(r"(key=)[^&\s'\")]+", r"\1***", str(text))
 
 
 def to_float(x):
@@ -244,7 +249,7 @@ class Collector:
         try:                                                                             # 1 FETCH + 2 DECODE
             f = self.source.fetch()
         except Exception as e:
-            msg = f"{type(e).__name__}: {e}"[:160]
+            msg = redact(f"{type(e).__name__}: {e}")[:160]
             stages.append(("FETCH", "FAIL", msg))
             self.stats["failed"] += 1
             health["error"] = msg
@@ -274,7 +279,8 @@ class Collector:
             health["error"] = "empty_or_short_snapshot"
             self.log(f"Feed returned only {n} vehicles (usually ~{typical}). Ignored it, nothing was deleted.", "warn")
             self.write_health(health)
-            return self.finish(rep, False)
+            self.finish(rep, False)
+            return "empty"                     # the server often fixes itself in seconds: retry soon, no back-off
         self.counts.append(n)
         age_txt = f", feed time {health['feed_age_s']} s old" if health["feed_age_s"] != "" else ""
         stages.append(("DECODE", "ok", f"{n} vehicles in the file{age_txt}"))
@@ -306,7 +312,7 @@ class Collector:
             self.stats["cycles_bytes"] += 1
             self.stats["bytes"] = sum(p.stat().st_size for p in (self.dir / "clean").glob("*.csv.gz"))
         except Exception as e:
-            stages.append(("SAVE", "FAIL", f"{type(e).__name__}: {e}"[:150]))
+            stages.append(("SAVE", "FAIL", redact(f"{type(e).__name__}: {e}")[:150]))
             health["error"] = "save_failed"
             self.log(f"Could not write file: {e}", "err")
         for r in kept:
@@ -348,9 +354,14 @@ class Collector:
         while not self.stop:
             if not self.paused or self.force:
                 self.force = False
-                ok = self.cycle()
-                fails = 0 if ok else fails + 1
-                delay = self.interval if ok else min(self.interval * 2 ** min(fails, 3), 120)
+                res = self.cycle()
+                if res is True:
+                    fails, delay = 0, self.interval
+                elif res == "empty":
+                    delay = min(5, self.interval)
+                else:
+                    fails += 1
+                    delay = min(self.interval * 2 ** min(fails, 3), 120)
             else:
                 delay = 1
             self.next_at = time.time() + delay
@@ -516,7 +527,7 @@ def inspect(data_dir):
         print(f"No data in {d}/clean/ yet. Run:  python otd_collector.py run"); return
     print("=== COLLECTED DATA (times in IST) ===")
     for f in files:
-        df = pd.read_csv(f, dtype={"vehicle_id": str, "route_id": str, "trip_id": str})
+        df = pd.read_csv(f, dtype={"vehicle_id": str, "route_id": str, "trip_id": str, "flag": str, "bearing": str, "stop_id": str, "occupancy": str}, low_memory=False)
         hrs = ((df["ts"] + IST) // 3600 % 24).astype(int).value_counts().sort_index()
         print(f"\n{f.name}: {len(df):,} rows | {df['vehicle_id'].nunique():,} buses | {df['route_id'].nunique():,} routes | {f.stat().st_size / 1e6:.1f} MB")
         dt = df["dt_s"].dropna()

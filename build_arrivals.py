@@ -11,8 +11,9 @@ The feed only gives dots ("bus X was at lat/lon at time T"). This script finds W
 
 Commands (put this file next to otd_collector.py, so the default folders 'data' and 'gtfs' work):
   python build_arrivals.py selftest                     simulated buses with known truth: shows how accurate the method is
-  python build_arrivals.py run                          process every day found in data/clean/
-  python build_arrivals.py run --date 2026-10-11        one day;   --routes 2097,1957  only these route_ids
+  python build_arrivals.py run                          process only NEW or CHANGED days found in data/clean/
+  python build_arrivals.py run --date 2026-10-11        one day;   --force  redo days that are up to date;   --routes 2097,1957  only these route_ids
+  python build_arrivals.py run --shapes                 use the real road shape from shapes.txt instead of straight lines between stops
   python build_arrivals.py show --vehicle DL1PC1234     step-by-step view of one bus (pings -> progress -> arrivals)
 """
 import argparse, math, pickle, sys, tempfile, time
@@ -25,6 +26,8 @@ ON_ROUTE_M = 100      # a ping within this distance of the route line counts as 
 BACK_M = 250          # progress falling back by more than this = a new trip started
 RUN_GAP_S = 300       # no on-route ping for this long = the bus run is cut here
 MAX_GAP_S = 120       # arrival is only kept if the two pings around the stop are at most this far apart in time
+VMAX = 20.0           # m/s: progress cannot jump faster than this (72 km/h) between two pings
+SLACK_M = 100         # extra metres allowed on top of that for GPS noise
 IST = 19800
 
 
@@ -34,21 +37,44 @@ def say(i, n, title, plain):
 
 # ============================ GTFS -> route lines ============================
 class Pattern:
-    """Ordered stops of one route_id, joined by straight lines. progress = metres along this line."""
-    def __init__(self, route_id, short, stop_ids, stops):
+    """One route_id: its stops, and the line the bus follows (straight lines between stops, or the real shape).
+    progress = metres along that line.  stop_prog = progress of each stop."""
+    def __init__(self, route_id, short, stop_ids, stops, shape=None):
         pts = [(s,) + tuple(stops[s]) for s in stop_ids if s in stops]
         self.route_id, self.short = route_id, short
         self.stop_ids = [p[0] for p in pts]
         self.names = [p[1] for p in pts]
-        lat = np.array([p[2] for p in pts], float); lon = np.array([p[3] for p in pts], float)
+        slat = np.array([p[2] for p in pts], float); slon = np.array([p[3] for p in pts], float)
         self.ok = len(pts) >= 2
-        if self.ok:
-            self.lat0, self.lon0 = float(lat.mean()), float(lon.mean())
-            self.kx = 111320.0 * math.cos(math.radians(self.lat0))
-            self.x, self.y = (lon - self.lon0) * self.kx, (lat - self.lat0) * 110540.0
-            self.seglen = np.hypot(np.diff(self.x), np.diff(self.y))
-            self.cum = np.concatenate([[0.0], np.cumsum(self.seglen)])      # progress of each stop
-            self.total = float(self.cum[-1])
+        if not self.ok:
+            return
+        self.geometry = "stops"
+        plat, plon = slat, slon
+        if shape is not None and len(shape[0]) >= 2:
+            plat, plon, self.geometry = np.asarray(shape[0], float), np.asarray(shape[1], float), "shape"
+        self.lat0, self.lon0 = float(plat.mean()), float(plon.mean())
+        self.kx = 111320.0 * math.cos(math.radians(self.lat0))
+        self.x, self.y = (plon - self.lon0) * self.kx, (plat - self.lat0) * 110540.0
+        self.seglen = np.hypot(np.diff(self.x), np.diff(self.y))
+        self.cum = np.concatenate([[0.0], np.cumsum(self.seglen)])           # progress of each line vertex
+        self.total = float(self.cum[-1])
+        self.stop_prog = self.cum.copy() if self.geometry == "stops" else self._stop_progress(slat, slon)
+
+    def _stop_progress(self, slat, slon):
+        """Progress of each stop on the shape line. Stops are placed in order (never behind the previous stop)."""
+        ax, ay, bx, by = self.x[:-1], self.y[:-1], self.x[1:], self.y[1:]
+        dx, dy = bx - ax, by - ay
+        l2 = np.where(dx * dx + dy * dy == 0, 1.0, dx * dx + dy * dy)
+        out, prev = [], 0.0
+        for lat, lon in zip(slat, slon):
+            X, Y = (lon - self.lon0) * self.kx, (lat - self.lat0) * 110540.0
+            t = np.clip(((X - ax) * dx + (Y - ay) * dy) / l2, 0, 1)
+            d = np.hypot(X - (ax + t * dx), Y - (ay + t * dy))
+            d = np.where(self.cum[1:] >= prev - 50, d, np.inf)
+            i = int(d.argmin()) if np.isfinite(d).any() else len(d) - 1
+            prev = max(prev, float(self.cum[i] + t[i] * self.seglen[i]))
+            out.append(prev)
+        return np.array(out)
 
     def project_many(self, lat, lon, chunk=20000):
         """For many pings: (distance to the line in m, progress along the line in m)."""
@@ -67,14 +93,21 @@ class Pattern:
         return dist, prog
 
 
-def load_patterns(gtfs):
+def load_patterns(gtfs, use_shapes=False):
     gtfs = Path(gtfs)
     need = ["routes.txt", "trips.txt", "stops.txt", "stop_times.txt"]
     for f in need:
         if not (gtfs / f).exists():
             raise SystemExit(f"Missing {gtfs / f}. Put your GTFS .txt files in '{gtfs}/' (or use --gtfs).")
+    if use_shapes:
+        has_col = "shape_id" in pd.read_csv(gtfs / "trips.txt", nrows=0).columns
+        if not (gtfs / "shapes.txt").exists() or not has_col:
+            print("      WARNING: --shapes needs shapes.txt and a shape_id column in trips.txt. Using straight lines between stops instead.")
+            use_shapes = False
+        else:
+            need.append("shapes.txt")
     sig = [(f, (gtfs / f).stat().st_mtime, (gtfs / f).stat().st_size) for f in need]
-    cache = gtfs / ".arrival_patterns.pkl"
+    cache = gtfs / (".arrival_patterns_shapes.pkl" if use_shapes else ".arrival_patterns.pkl")
     d = None
     if cache.exists():
         try:
@@ -84,14 +117,14 @@ def load_patterns(gtfs):
         except Exception:
             d = None
     if d is None:
-        print("      first time: reading stop_times.txt (can take a few minutes, then it is cached) ...", flush=True)
+        print("      first time: reading stop_times.txt" + (" and shapes.txt" if use_shapes else "") + " (can take a few minutes, then it is cached) ...", flush=True)
         routes = pd.read_csv(gtfs / "routes.txt", dtype=str)
         short = dict(zip(routes["route_id"], routes["route_short_name"])) if "route_short_name" in routes else {}
         sdf = pd.read_csv(gtfs / "stops.txt", dtype={"stop_id": str})
         sdf["stop_lat"] = pd.to_numeric(sdf["stop_lat"], errors="coerce"); sdf["stop_lon"] = pd.to_numeric(sdf["stop_lon"], errors="coerce")
         sdf = sdf.dropna(subset=["stop_lat", "stop_lon"])
         stops = {r.stop_id: (str(r.stop_name), float(r.stop_lat), float(r.stop_lon)) for r in sdf.itertuples()}
-        trips = pd.read_csv(gtfs / "trips.txt", dtype=str, usecols=["route_id", "trip_id"])
+        trips = pd.read_csv(gtfs / "trips.txt", dtype=str, usecols=["route_id", "trip_id"] + (["shape_id"] if use_shapes else []))
         sizes = pd.Series(dtype="float64")
         for ch in pd.read_csv(gtfs / "stop_times.txt", usecols=["trip_id"], dtype=str, chunksize=1_000_000):
             sizes = sizes.add(ch["trip_id"].value_counts(), fill_value=0)
@@ -104,19 +137,32 @@ def load_patterns(gtfs):
         st = pd.concat(parts)
         st["stop_sequence"] = pd.to_numeric(st["stop_sequence"], errors="coerce")
         seq = st.sort_values(["trip_id", "stop_sequence"]).groupby("trip_id")["stop_id"].apply(list).to_dict()
-        raw = {r.route_id: (short.get(r.route_id, r.route_id), seq.get(r.trip_id, [])) for r in rep.itertuples()}
+        shp = {}
+        if use_shapes:
+            ws, parts = set(rep["shape_id"].dropna()), []
+            for ch in pd.read_csv(gtfs / "shapes.txt", usecols=["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"], dtype=str, chunksize=1_000_000):
+                parts.append(ch[ch["shape_id"].isin(ws)])
+            sh = pd.concat(parts)
+            for c in ("shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"):
+                sh[c] = pd.to_numeric(sh[c], errors="coerce")
+            sh = sh.dropna().sort_values(["shape_id", "shape_pt_sequence"])
+            shp = {k: (g["shape_pt_lat"].values, g["shape_pt_lon"].values) for k, g in sh.groupby("shape_id")}
+        raw = {r.route_id: (short.get(r.route_id, r.route_id), seq.get(r.trip_id, []), shp.get(getattr(r, "shape_id", None))) for r in rep.itertuples()}
         d = {"sig": sig, "stops": stops, "raw": raw}
         pickle.dump(d, open(cache, "wb"))
     pats = {}
-    for rid, (sh, sids) in d["raw"].items():
-        p = Pattern(rid, sh, sids, d["stops"])
+    for rid, tup in d["raw"].items():
+        sh_, sids, *rest = tup
+        p = Pattern(rid, sh_, sids, d["stops"], rest[0] if rest else None)
         if p.ok:
             pats[rid] = p
+    n_shape = sum(1 for p in pats.values() if p.geometry == "shape")
+    print(f"      route line: {'real road shape for %d route_ids, straight lines between stops for the rest' % n_shape if use_shapes else 'straight lines between stops'}")
     return pats
 
 
 # ============================ the 4 processing steps ============================
-def match_pings(df, pats, a):
+def match_pings(df, pats, a, verbose=True):
     """Step 2: distance to route line + progress along the route for every ping."""
     df = df[df["route_id"].isin(pats)].reset_index(drop=True)
     lat, lon = df["lat"].values, df["lon"].values
@@ -125,7 +171,7 @@ def match_pings(df, pats, a):
     step = max(1, len(groups) // 4)
     for k, (rid, ix) in enumerate(groups.items(), 1):
         perp[ix], prog[ix] = pats[rid].project_many(lat[ix], lon[ix])
-        if k % step == 0 or k == len(groups):
+        if verbose and (k % step == 0 or k == len(groups)):
             print(f"      matched {k}/{len(groups)} route_ids", flush=True)
     df["perp"], df["prog"] = perp, prog
     df["on_route"] = df["perp"] <= a.on_route
@@ -133,12 +179,12 @@ def match_pings(df, pats, a):
 
 
 def build_runs(df, a):
-    """Step 3: cut pings into runs. Returns (on-route pings with run_id, table of runs)."""
+    """Step 3: cut pings into runs, drop single-ping 'spikes'. Returns (on-route pings with run_id, table of runs, number of spikes)."""
     allk = df.groupby(["vehicle_id", "route_id", "trip_id"]).agg(n_all=("ts", "size"), n_off=("on_route", lambda s: int((~s).sum())))
     p = df[df["on_route"]].sort_values(["vehicle_id", "route_id", "trip_id", "ts"])
     p = p.drop_duplicates(["vehicle_id", "route_id", "trip_id", "ts"]).reset_index(drop=True)
     ts, pr = p["ts"].values, p["prog"].values
-    run_id = np.full(len(p), -1); runs = []; rid = 0
+    run_id = np.full(len(p), -1); runs = []; rid = 0; spikes = 0
     for key, ix in p.groupby(["vehicle_id", "route_id", "trip_id"], sort=False).indices.items():
         ix = np.sort(ix); t, g = ts[ix], pr[ix]
         st = allk.loc[key]
@@ -150,18 +196,29 @@ def build_runs(df, a):
             runs.append(dict(run_id=rid, **base, t_start=t[0], t_end=t[-1], n_pings=len(ix), prog_start=g[0], prog_end=g[-1], direction_ok=False, usable=False))
             rid += 1
             continue
-        s = 0
-        while s < len(ix):
-            e, rmax = s + 1, g[s]
-            while e < len(ix) and t[e] - t[e - 1] <= a.run_gap and g[e] >= rmax - BACK_M:
-                rmax = max(rmax, g[e]); e += 1
-            seg = ix[s:e]; run_id[seg] = rid
-            gg = pr[seg]
+        segs, cur, pend = [], [0], []
+        for k in range(1, len(ix)):
+            last = cur[-1]; dt = t[k] - t[last]; dg = g[k] - g[last]
+            if dt > a.run_gap:                                           # long silence: new run
+                spikes += len(pend); segs.append(cur); cur, pend = [k], []
+                continue
+            if dg > a.vmax * dt + SLACK_M or dg < -BACK_M:               # not believable for the same trip
+                if pend and abs(g[k] - g[pend[-1]]) > a.vmax * (t[k] - t[pend[-1]]) + SLACK_M:
+                    spikes += len(pend); pend = []
+                pend.append(k)
+                if len(pend) >= 3:                                       # 3 pings agree with each other: a genuinely new trip
+                    segs.append(cur); cur, pend = list(pend), []
+                continue
+            spikes += len(pend); pend = []                               # earlier suspicious pings were one-off spikes
+            cur.append(k)
+        spikes += len(pend); segs.append(cur)
+        for seg_local in segs:
+            seg = ix[seg_local]; run_id[seg] = rid; gg = pr[seg]
             runs.append(dict(run_id=rid, **base, t_start=ts[seg[0]], t_end=ts[seg[-1]], n_pings=len(seg), prog_start=gg[0], prog_end=gg.max(),
                              direction_ok=True, usable=len(seg) >= 3 and gg.max() - gg[0] >= 200))
-            rid += 1; s = e
+            rid += 1
     p["run_id"] = run_id
-    return p, pd.DataFrame(runs)
+    return p[p["run_id"] >= 0].reset_index(drop=True), pd.DataFrame(runs), spikes
 
 
 def find_arrivals(p, runs, pats, a):
@@ -173,7 +230,7 @@ def find_arrivals(p, runs, pats, a):
     for r in runs[runs["usable"]].itertuples():
         ix = np.sort(idx_by_run[r.run_id]); t = ts[ix]
         pm = np.maximum.accumulate(pr[ix])                  # progress never goes backwards (removes GPS wobble)
-        P = pats[r.route_id].cum
+        P = pats[r.route_id].stop_prog
         expected += int(((P > pm[0]) & (P <= pm[-1])).sum())
         j = np.searchsorted(pm, P, side="left")             # first ping at or after each stop
         ok = (j > 0) & (j < len(pm))
@@ -205,23 +262,31 @@ def process(df, pats, a, quiet=False):
     df = df[df["flag"].fillna("") == ""]
     if not quiet:
         say(2, 5, "MATCH", f"{n0:,} pings read, {n0 - len(df):,} dropped because the collector flagged them as GPS jumps.")
-    df = match_pings(df, pats, a)
+    df = match_pings(df, pats, a, verbose=not quiet)
     if df.empty:
-        return df, df, df, 0
+        return df, df, df, 0, df, 0
     if not quiet:
-        print(f"      {df['on_route'].mean() * 100:.1f}% of {len(df):,} pings are within {a.on_route} m of their route line (the rest are depot trips, diversions, wrong route_id or bad GPS)")
-        say(3, 5, "RUNS", "Each bus's pings are cut into trips; a trip that moves backwards along its route is marked as a direction mismatch.")
-    p, runs = build_runs(df, a)
+        print(f"      {df['on_route'].mean() * 100:.1f}% of {len(df):,} pings are within {a.on_route:.0f} m of their route line (the rest are depot trips, diversions, wrong route_id or bad GPS)")
+        say(3, 5, "RUNS", "Each bus's pings are cut into trips; one-off position spikes are removed; a trip that moves backwards along its route is marked as a direction mismatch.")
+    p, runs, spikes = build_runs(df, a)
     if not quiet:
         say(4, 5, "ARRIVALS", "For every stop between a bus's first and last ping, the pass time is interpolated between the two pings around the stop.")
     arr, expected = find_arrivals(p, runs, pats, a)
-    return p, runs, arr, expected
+    return p, runs, arr, expected, df, spikes
 
 
-def report(df_in, p, runs, arr, expected, pats):
+def report(dfm, p, runs, arr, expected, spikes, pats):
     print("\n================ QUALITY REPORT ================")
     if runs.empty:
         print("no runs found (are the route_ids in your data present in the GTFS?)"); return
+    bins = [-1, 50, 100, 200, 500, 1000, np.inf]; names = ["<=50 m", "50-100", "100-200", "200-500", "500-1000", ">1 km"]
+    sh = pd.cut(dfm["perp"], bins, labels=names).value_counts(normalize=True).reindex(names).fillna(0)
+    print("pings by distance from their route line: " + " | ".join(f"{n} {100 * v:.1f}%" for n, v in sh.items()))
+    print("   (many pings at 100-500 m = the line is too rough, try --shapes;  many above 1 km = depot trips or wrong route_id)")
+    g = dfm.groupby("route_id").agg(n=("perp", "size"), on=("on_route", "mean"))
+    g = g[g["n"] >= 100].sort_values("on").head(5)
+    print("routes with the lowest share of pings on the line: " + ", ".join(f"{pats[r].short} ({100 * v.on:.0f}% of {int(v.n):,})" for r, v in g.iterrows()))
+    print(f"one-off position spikes removed: {spikes:,} pings")
     u = runs["usable"].sum(); bw = (~runs["direction_ok"]).sum()
     print(f"runs: {len(runs):,}  usable {u:,}  | moving against their route_id direction: {bw:,} ({100 * bw / len(runs):.1f}%)  | too short: {len(runs) - u - bw:,}")
     if arr.empty:
@@ -230,11 +295,19 @@ def report(df_in, p, runs, arr, expected, pats):
     print("  quality (gap between the two pings around the stop):  " + ", ".join(f"{k} {v:,}" for k, v in arr["quality"].value_counts().items()))
     print(f"  coverage: {100 * len(arr) / max(expected, 1):.1f}% of the stops each bus drove past got an arrival time (rest skipped: pings too far apart)")
     print(f"  median gap between the pings used: {arr['gap_s'].median():.0f} s, median speed around the stop: {arr['speed_kmh'].median():.1f} km/h")
-    a2 = arr.copy(); a2["pat_cum"] = [pats[r].cum[k] for r, k in zip(a2["route_id"], a2["stop_idx"])]
+    a2 = arr.copy(); a2["pat_cum"] = [pats[r].stop_prog[k] for r, k in zip(a2["route_id"], a2["stop_idx"])]
     a2["next_t"] = a2.groupby("run_id")["arrive_ts"].shift(-1); a2["next_cum"] = a2.groupby("run_id")["pat_cum"].shift(-1)
-    s = a2.dropna(subset=["next_t"]); dt = s["next_t"] - s["arrive_ts"]
-    ok = dt > 0; v = (s["next_cum"] - s["pat_cum"])[ok] / dt[ok] * 3.6
-    print(f"  stop-to-stop travel: {len(s):,} pairs | median speed {v.median():.1f} km/h | suspicious (>60 km/h): {100 * (v > 60).mean():.1f}% | zero/negative time: {100 * (~ok).mean():.1f}%")
+    s = a2.dropna(subset=["next_t"]).copy(); dt = s["next_t"] - s["arrive_ts"]
+    s["v"] = np.where(dt > 0, (s["next_cum"] - s["pat_cum"]) / dt.where(dt > 0, np.nan) * 3.6, np.nan)
+    sus = s["v"] > 60
+    print(f"  stop-to-stop travel: {len(s):,} pairs | median speed {s['v'].median():.1f} km/h | suspicious (>60 km/h): {100 * sus.mean():.1f}% | zero/negative time: {100 * s['v'].isna().mean():.1f}%")
+    if sus.any():
+        byq = s.groupby("quality")["v"].apply(lambda x: 100 * (x > 60).mean()).round(1).to_dict()
+        circ = {r: math.hypot(p_.x[0] - p_.x[-1], p_.y[0] - p_.y[-1]) < 300 for r, p_ in pats.items()}
+        sc = s[sus]["route_id"].map(circ).mean() * 100
+        top = s[sus]["route_id"].value_counts().head(5)
+        print(f"     suspicious share by quality: {byq}   | on circular routes: {sc:.0f}% of the suspicious pairs")
+        print("     routes with most suspicious pairs: " + ", ".join(f"{pats[r].short} ({n:,})" for r, n in top.items()))
     top = arr["route_id"].value_counts().head(5)
     print("  most arrivals: " + ", ".join(f"{pats[r].short} ({n:,})" for r, n in top.items()))
 
@@ -247,23 +320,25 @@ def read_clean(path):
     return df.dropna(subset=["vehicle_id", "route_id", "ts", "lat", "lon"])
 
 
-def run_file(path, pats, a, outdir):
+def run_file(path, pats, a, outdir, quiet=False):
     day = Path(path).name.split(".")[0]
-    print(f"\n######## {day} ########")
-    say(1, 5, "LOAD", f"reading {path}")
+    if not quiet:
+        print(f"\n######## {day} ########")
+        say(1, 5, "LOAD", f"reading {path}")
     df = read_clean(path)
     if a.routes:
         df = df[df["route_id"].isin(a.routes.split(","))]
-    p, runs, arr, expected = process(df, pats, a)
+    p, runs, arr, expected, dfm, spikes = process(df, pats, a, quiet=quiet)
     if runs.empty:
         print("nothing to save"); return None
     outdir.mkdir(parents=True, exist_ok=True)
-    say(5, 5, "SAVE", f"writing files into {outdir}/")
     arr.to_csv(outdir / f"{day}_arrivals.csv.gz", index=False)
     runs.to_csv(outdir / f"{day}_runs.csv.gz", index=False)
-    print(f"      {outdir / (day + '_arrivals.csv.gz')}  ({len(arr):,} rows)\n      {outdir / (day + '_runs.csv.gz')}  ({len(runs):,} rows)")
-    report(df, p, runs, arr, expected, pats)
-    return arr
+    if not quiet:
+        say(5, 5, "SAVE", f"writing files into {outdir}/")
+        print(f"      {outdir / (day + '_arrivals.csv.gz')}  ({len(arr):,} rows)\n      {outdir / (day + '_runs.csv.gz')}  ({len(runs):,} rows)")
+        report(dfm, p, runs, arr, expected, spikes, pats)
+    return arr, runs, dfm, spikes
 
 
 def cmd_run(a):
@@ -272,25 +347,36 @@ def cmd_run(a):
         files = [f for f in files if f.name.startswith(a.date)]
     if not files:
         raise SystemExit(f"No clean files found in {a.data}/clean/ (date filter: {a.date}).")
-    pats = load_patterns(a.gtfs)
-    print(f"      {len(pats):,} route_ids have a usable stop list")
+    outdir = Path(a.data) / "arrivals"
+    todo = []
     for f in files:
-        run_file(f, pats, a, Path(a.data) / "arrivals")
+        out = outdir / f"{f.name.split('.')[0]}_arrivals.csv.gz"
+        if out.exists() and out.stat().st_mtime >= f.stat().st_mtime and not a.force and not a.routes:
+            print(f"skip {f.name}: arrivals are already up to date (use --force to redo)")
+        else:
+            todo.append(f)
+    if not todo:
+        print("nothing new to process."); return
+    print(f"will process: {', '.join(f.name.split('.')[0] for f in todo)}")
+    pats = load_patterns(a.gtfs, a.shapes)
+    print(f"      {len(pats):,} route_ids have a usable stop list")
+    for f in todo:
+        run_file(f, pats, a, outdir)
 
 
 def cmd_show(a):
     files = sorted((Path(a.data) / "clean").glob("*.csv.gz"))
     if a.date:
         files = [f for f in files if f.name.startswith(a.date)]
-    pats = load_patterns(a.gtfs)
+    pats = load_patterns(a.gtfs, a.shapes)
     for f in files:
         df = read_clean(f); df = df[df["vehicle_id"] == a.vehicle]
         if df.empty:
             continue
-        p, runs, arr, _ = process(df, pats, a, quiet=True)
+        p, runs, arr, _, _, _ = process(df, pats, a, quiet=True)
         print(f"\n===== {a.vehicle} on {f.name} =====")
         d = df[df["flag"].fillna("") == ""]
-        d = match_pings(d, pats, a).sort_values("ts")
+        d = match_pings(d, pats, a, verbose=False).sort_values("ts")
         for r in d.itertuples():
             pt = pats[r.route_id]
             t = time.strftime("%H:%M:%S", time.gmtime(r.ts + IST))
@@ -312,11 +398,15 @@ def cmd_selftest(a):
     def xy(s): th = s / R; return R * np.sin(th), R * (1 - np.cos(th))
     def ll(x, y): return lat0 + y / 110540.0, lon0 + x / (111320.0 * math.cos(math.radians(lat0)))
     sx, sy = xy(S); slat, slon = ll(sx, sy)
-    (tmp / "gtfs" / "routes.txt").write_text("route_id,route_short_name\n1,TESTUP\n2,TESTDOWN\n")
-    (tmp / "gtfs" / "trips.txt").write_text("route_id,trip_id\n1,T1\n2,T2\n")
-    (tmp / "gtfs" / "stops.txt").write_text("stop_id,stop_name,stop_lat,stop_lon\n" + "".join(f"S{k},Stop {k},{slat[k]:.6f},{slon[k]:.6f}\n" for k in range(nst)))
-    (tmp / "gtfs" / "stop_times.txt").write_text("trip_id,stop_id,stop_sequence\n" + "".join(f"T1,S{k},{k + 1}\n" for k in range(nst)) + "".join(f"T2,S{k},{nst - k}\n" for k in range(nst)))
-    def simulate(start, reverse=False):
+    ss = np.arange(0, S[-1] + 25, 25.0); hx, hy = xy(ss); hlat, hlon = ll(hx, hy)      # the real road shape: a point every 25 m
+    g = tmp / "gtfs"
+    (g / "routes.txt").write_text("route_id,route_short_name\n1,TESTUP\n2,TESTDOWN\n")
+    (g / "trips.txt").write_text("route_id,trip_id,shape_id\n1,T1,SH1\n2,T2,SH2\n")
+    (g / "stops.txt").write_text("stop_id,stop_name,stop_lat,stop_lon\n" + "".join(f"S{k},Stop {k},{slat[k]:.6f},{slon[k]:.6f}\n" for k in range(nst)))
+    (g / "stop_times.txt").write_text("trip_id,stop_id,stop_sequence\n" + "".join(f"T1,S{k},{k + 1}\n" for k in range(nst)) + "".join(f"T2,S{k},{nst - k}\n" for k in range(nst)))
+    (g / "shapes.txt").write_text("shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n" + "".join(f"SH1,{la:.6f},{lo:.6f},{i}\n" for i, (la, lo) in enumerate(zip(hlat, hlon)))
+                                  + "".join(f"SH2,{la:.6f},{lo:.6f},{i}\n" for i, (la, lo) in enumerate(zip(hlat[::-1], hlon[::-1]))))
+    def simulate(start):
         """true bus motion at 1 s steps: random speed, dwell at some stops"""
         s, v, t, truth, nxt, dwell = 0.0, 7.0, start, {}, 0, 0
         path = [(t, 0.0)]
@@ -330,26 +420,26 @@ def cmd_selftest(a):
                 if rng.random() < 0.7: dwell = int(rng.integers(8, 30))
             path.append((t, s))
         return np.array(path), truth
-    rows, truths = [], {}
+    rows, truths, nspike = [], {}, 0
     base = 1_800_000_000
-    for b in range(30):                                              # 30 normal buses
+    for b in range(30):                                              # 30 normal buses (1% of pings are position spikes)
         path, truth = simulate(base + b * 120)
         pt = base + b * 120 + rng.uniform(0, 15)
         while pt < path[-1, 0]:
-            s = np.interp(pt, path[:, 0], path[:, 1]); x, y = xy(min(s, S[-1])); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
-            rows.append((pt, f"BUS{b}", "1", f"T{b}", la, lo))
-            pt += rng.uniform(10, 30)
+            s = np.interp(pt, path[:, 0], path[:, 1])
+            if rng.random() < 0.01: s = s + 900 if s < S[-1] - 900 else s - 900; nspike += 1
+            x, y = xy(min(max(s, 0), S[-1])); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
+            rows.append((pt, f"BUS{b}", "1", f"T{b}", la, lo)); pt += rng.uniform(10, 30)
         truths[f"BUS{b}"] = truth
-    path, _ = simulate(base + 5000); pt = base + 5000                # 2 buses that drive the opposite way but are labelled route 1
-    for b in range(2):
+    path, _ = simulate(base + 5000)
+    for b in range(2):                                               # 2 buses that drive the opposite way but are labelled route 1
         pt = base + 5000 + b * 60
         while pt < path[-1, 0] + b * 60:
             s = S[-1] - np.interp(pt - b * 60, path[:, 0], path[:, 1]); x, y = xy(max(s, 0)); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
             rows.append((pt, f"WRONG{b}", "1", "TW", la, lo)); pt += rng.uniform(10, 30)
     for k in range(40):                                              # a bus far away from its route line (depot trip)
         rows.append((base + 9000 + k * 20, "DEPOT", "1", "TD", lat0 + 0.05, lon0 + 0.05))
-    path, truth = simulate(base + 7000); truths["TWICE"] = {}        # one vehicle doing the route twice with the SAME trip_id
-    for rep in range(2):
+    for rep in range(2):                                             # one vehicle doing the route twice with the SAME trip_id
         off = rep * 4200; path, truth = simulate(base + 7000 + off)
         if rep == 0: truths["TWICE"] = dict(truth)
         pt = base + 7000 + off
@@ -357,25 +447,23 @@ def cmd_selftest(a):
             s = np.interp(pt, path[:, 0], path[:, 1]); x, y = xy(min(s, S[-1])); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
             rows.append((pt, "TWICE", "1", "TT", la, lo)); pt += rng.uniform(10, 30)
     df = pd.DataFrame(rows, columns=["ts", "vehicle_id", "route_id", "trip_id", "lat", "lon"]); df["flag"] = ""
-    df.to_csv(tmp / "data" / "clean" / "2030-01-01.csv.gz", index=False)
-    print(f"Simulated {len(df):,} pings: 30 normal buses, 2 buses driving against their route label, 1 depot bus, 1 bus doing 2 trips with the same trip_id.")
-    a.data, a.gtfs, a.routes = str(tmp / "data"), str(tmp / "gtfs"), None
-    pats = load_patterns(a.gtfs)
-    arr = run_file(tmp / "data" / "clean" / "2030-01-01.csv.gz", pats, a, tmp / "data" / "arrivals")
-    # compare with the truth
-    errs = []; first_runs = {}
-    for r in arr.itertuples():
-        tt = truths.get(r.vehicle_id, {}).get(r.stop_idx)
-        if tt is not None and r.vehicle_id != "TWICE":
-            errs.append(r.arrive_ts - tt)
-    errs = np.array(errs)
-    tw = arr[arr["vehicle_id"] == "TWICE"]
+    path_clean = tmp / "data" / "clean" / "2030-01-01.csv.gz"; df.to_csv(path_clean, index=False)
+    print(f"Simulated {len(df):,} pings: 30 normal buses ({nspike} pings moved 900 m = spikes), 2 buses against their label, 1 depot bus, 1 bus with 2 trips under one trip_id.")
+    a.routes = None; res = {}
+    for mode in ("stops", "shapes"):
+        pats = load_patterns(str(g), mode == "shapes")
+        arr, runs, dfm, spikes = run_file(path_clean, pats, a, tmp / "data" / f"arrivals_{mode}", quiet=(mode == "shapes"))
+        errs = np.array([r.arrive_ts - truths[r.vehicle_id][r.stop_idx] for r in arr.itertuples() if r.vehicle_id.startswith("BUS") and r.stop_idx in truths[r.vehicle_id]])
+        res[mode] = dict(on=100 * dfm["on_route"].mean(), n=len(errs), mean=errs.mean(), med=np.median(abs(errs)), p90=np.percentile(abs(errs), 90), worst=abs(errs).max(),
+                         wrong=int(arr["vehicle_id"].str.startswith("WRONG").sum()), depot=int((arr["vehicle_id"] == "DEPOT").sum()),
+                         twice=arr[arr["vehicle_id"] == "TWICE"]["run_id"].nunique(), spikes=spikes)
     print("\n================ SELF-TEST RESULT (simulated data, known truth) ================")
-    print(f"compared {len(errs):,} detected arrivals with the true pass times of 30 normal buses")
-    print(f"  error: mean {errs.mean():+.1f} s | median absolute {np.median(abs(errs)):.1f} s | 90th percentile {np.percentile(abs(errs), 90):.1f} s | worst {abs(errs).max():.0f} s")
-    print(f"  buses driving against their label produced {int((arr['vehicle_id'].str.startswith('WRONG')).sum())} arrivals (should be 0)")
-    print(f"  depot bus produced {int((arr['vehicle_id'] == 'DEPOT').sum())} arrivals (should be 0)")
-    print(f"  same trip_id used twice was cut into {tw['run_id'].nunique()} runs (should be 2)")
+    print(f"{'route line used':<34}{'on line':>9}{'arrivals':>10}{'mean err':>10}{'median |err|':>14}{'p90 |err|':>11}{'worst':>7}")
+    for m, lab in (("stops", "straight lines between stops"), ("shapes", "real road shape (--shapes)")):
+        r = res[m]; print(f"{lab:<34}{r['on']:>8.1f}%{r['n']:>10}{r['mean']:>+9.1f}s{r['med']:>13.1f}s{r['p90']:>10.1f}s{r['worst']:>6.0f}s")
+    r = res["shapes"]
+    print(f"checks (both modes): wrong-direction buses gave {res['stops']['wrong']}/{r['wrong']} arrivals (should be 0) | depot bus {res['stops']['depot']}/{r['depot']} (0) | same trip_id twice -> {res['stops']['twice']}/{r['twice']} runs (2)")
+    print(f"position spikes injected: {nspike} | removed by the spike filter: {res['stops']['spikes']} (stops mode) / {r['spikes']} (shapes mode)")
     print("These numbers are for SIMULATED buses with GPS noise of about 6 m and pings every 10-30 s. Real accuracy has to be checked with real data.")
 
 
@@ -386,6 +474,9 @@ def main():
     ap.add_argument("--date"); ap.add_argument("--routes", help="comma separated route_ids"); ap.add_argument("--vehicle")
     ap.add_argument("--on-route", type=float, default=ON_ROUTE_M); ap.add_argument("--max-gap", type=float, default=MAX_GAP_S)
     ap.add_argument("--run-gap", type=float, default=RUN_GAP_S)
+    ap.add_argument("--vmax", type=float, default=VMAX, help="fastest believable bus speed in m/s for the spike filter")
+    ap.add_argument("--shapes", action="store_true", help="use shapes.txt (real road line) instead of straight lines between stops")
+    ap.add_argument("--force", action="store_true", help="redo days whose arrivals are already up to date")
     a = ap.parse_args()
     if a.cmd == "show" and not a.vehicle:
         raise SystemExit("show needs --vehicle VEHICLE_ID")

@@ -1,0 +1,3 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version
+Delhi Transport Corporation,http://dtc.delhi.gov.in/,en,20250101,20400101,v1
+Delhi Transport Department,https://transport.delhi.gov.in/,en,20250101,20400101,v1

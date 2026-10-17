@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 import os
+import webbrowser
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,6 +51,11 @@ def to_float(x):
 def fmt0(v):
     f = to_float(v)
     return '-' if f is None else f'{f:.0f}'
+
+
+def maps_url(lat, lon):
+    """Google Maps link that drops a pin on this position."""
+    return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
 
 
 def hav(lat1, lon1, lat2, lon2):
@@ -419,12 +425,14 @@ class GridScreen:
     def __init__(self, h=40, w=120):
         self.h, self.w = h, w
         self.g = [[" "] * w for _ in range(h)]
+        self.zones = []
 
     def size(self):
         return self.h, self.w
 
     def clear(self):
         self.g = [[" "] * self.w for _ in range(self.h)]
+        self.zones = []
 
     def put(self, r, c, text, style="n"):
         if r < 0 or r >= self.h:
@@ -432,6 +440,11 @@ class GridScreen:
         for i, ch in enumerate(str(text)):
             if 0 <= c + i < self.w:
                 self.g[r][c + i] = ch
+
+    def link(self, r, c, label, url):
+        """Draw a label that opens `url` in the default browser when clicked."""
+        self.put(r, c, label, "link")
+        self.zones.append((r, c, len(label), url))
 
     def refresh(self):
         pass
@@ -443,9 +456,14 @@ class GridScreen:
 class CursesScreen:
     def __init__(self, stdscr):
         self.s = stdscr
+        self.zones = []
         curses.curs_set(0)
         stdscr.keypad(True)
         stdscr.timeout(250)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)          # so that clicks on links reach the app
+        except curses.error:
+            pass
         self.styles = {"n": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE}
         if curses.has_colors():
             curses.start_color()
@@ -465,12 +483,14 @@ class CursesScreen:
             for i in range(6):
                 self.styles[f"c{i}"] = curses.A_BOLD
             self.styles.update(hdr=curses.A_REVERSE, warn=curses.A_BOLD, ok=0)
+        self.styles["link"] = curses.A_UNDERLINE | self.styles.get("c0", curses.A_BOLD)
 
     def size(self):
         return self.s.getmaxyx()
 
     def clear(self):
         self.s.erase()
+        self.zones = []
 
     def put(self, r, c, text, style="n"):
         h, w = self.s.getmaxyx()
@@ -481,6 +501,11 @@ class CursesScreen:
             self.s.addstr(r, max(c, 0), text, self.styles.get(style, 0))
         except curses.error:
             pass
+
+    def link(self, r, c, label, url):
+        """Draw a label that opens `url` in the default browser when clicked."""
+        self.put(r, c, label, "link")
+        self.zones.append((r, c, len(label), url))
 
     def refresh(self):
         self.s.refresh()
@@ -538,6 +563,14 @@ class App:
         H, W, mh = self.view(scr)
         if k in (-1, curses.KEY_RESIZE):
             return
+        if k == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED | curses.BUTTON1_DOUBLE_CLICKED):
+                    self.click(mx, my, scr)
+            except curses.error:
+                pass
+            return
         if self.mode == "search":
             return self.key_search(k)
         if self.mode == "help":
@@ -546,6 +579,8 @@ class App:
         if self.mode in ("raw", "fields"):
             if k in (27, ord("q"), ord("\n"), curses.KEY_ENTER, ord("?")):
                 self.mode = "map"; self.scroll = 0
+            elif k == ord("g") and self.mode == "raw":
+                self.open_here()
             elif k in (curses.KEY_DOWN, ord("j")):
                 self.scroll += 1
             elif k in (curses.KEY_UP, ord("k")):
@@ -568,6 +603,8 @@ class App:
                 self.sel = b.key; self.clat, self.clon = b.lat, b.lon; self.mode = "map"
             elif k == ord("m"):
                 _, la, lo = self.static.stops[self.stop]; self.clat, self.clon = la, lo; self.mode = "map"
+            elif k == ord("g"):
+                self.open_here()
             elif k == ord("f"):
                 self.force.set()
             return
@@ -604,8 +641,36 @@ class App:
             self.search = {"kind": "route", "q": "", "res": [], "i": 0}; self.mode = "search"
         elif k == ord("x"):
             self.route = None; self.sel = None
+        elif k == ord("g"): self.open_here()
         elif k == ord("i"): self.mode = "fields"; self.scroll = 0
         elif k == ord("?"): self.mode = "help"; self.scroll = 0
+
+    def open_url(self, url):
+        if time.time() - getattr(self, "_last_open", 0) < 0.8:          # one click can arrive as press + release
+            return
+        self._last_open = time.time()
+        try:
+            webbrowser.open(url)
+            self.msg = "opened in your browser: " + url[-34:]
+        except Exception as e:
+            self.msg = f"could not open the browser: {e}"
+
+    def click(self, x, y, scr):
+        for r, c, n, url in getattr(scr, "zones", []):
+            if y == r and c <= x < c + n:
+                self.open_url(url)
+                return True
+        return False
+
+    def open_here(self):
+        """g key: Google Maps for the stop board's stop, else the selected bus, else the map centre."""
+        if self.mode == "board" and self.stop:
+            _, la, lo = self.static.stops[self.stop]
+        elif self.sel in self.fleet.buses:
+            la, lo = self.fleet.buses[self.sel].lat, self.fleet.buses[self.sel].lon
+        else:
+            la, lo = self.clat, self.clon
+        self.open_url(maps_url(la, lo))
 
     def nearest_stop(self, lat, lon):
         st = self.static
@@ -741,7 +806,7 @@ class App:
         # crosshair
         scr.put(1 + mh // 2, W // 2, "+", "bold")
         self.draw_panel(scr, H, W, mh, vis)
-        self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | r route | x clear | i feed fields | ? help | q quit")
+        self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | r route | x clear | i fields | g Google Maps | ? help | q quit")
 
     def draw_panel(self, scr, H, W, mh, vis):
         top = mh + 1
@@ -752,7 +817,9 @@ class App:
             a = f.assignment(b)
             v, src = f.speed(b)
             rid = self.static.label(b.route_id) if b.route_id else "unknown"
-            scr.put(top + 1, 1, f"BUS {b.key}   route {rid}" + (f"  ->  {a.pat.headsign}" if a else ""), "bold")
+            head = f"BUS {b.key}   route {rid}" + (f"  ->  {a.pat.headsign}" if a else "")
+            scr.put(top + 1, 1, head, "bold")
+            scr.link(top + 1, len(head) + 4, "[open in Google Maps]", maps_url(b.lat, b.lon))
             fs = to_float(b.row.get("position.speed"))
             scr.put(top + 2, 1, f"pos {b.lat:.5f}, {b.lon:.5f}   speed {v * 3.6:.0f} km/h ({src})   feed speed {fs if fs is not None else '-'}   bearing {fmt0(b.row.get('position.bearing'))}   ping age {self.age(b):.0f}s")
             if a:
@@ -781,7 +848,9 @@ class App:
         name, la, lo = self.static.stops[sid]
         self.header(scr, W, f" | STOP BOARD")
         routes = sorted({self.static.label(p.route_id) for p, _ in self.static.stop_routes.get(sid, [])})
-        scr.put(2, 1, f"{name}   (stop {sid})   {la:.5f}, {lo:.5f}", "bold")
+        head = f"{name}   (stop {sid})   {la:.5f}, {lo:.5f}"
+        scr.put(2, 1, head, "bold")
+        scr.link(2, len(head) + 4, "[open in Google Maps]", maps_url(la, lo))
         scr.put(3, 1, f"{len(routes)} routes serve this stop: " + " ".join(routes[:40]), "dim")
         scr.put(5, 1, f"{'ROUTE':<8}{'TOWARDS':<30}{'ETA':>8}{'DIST':>9}{'SPEED':>8}  {'SPEED SRC':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
         rows = self.fleet.stop_board(sid)
@@ -793,7 +862,7 @@ class App:
             line = f"{r['route']:<8}{str(r['to'])[:28]:<30}{e:>8}{r['dist']:>8.0f}m{r['speed']:>6.0f}km  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}"
             scr.put(6 + i, 1, line, "rev" if i == self.board_i else self.style_for(r["route"]))
         scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
-        self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | f refresh | Esc back")
+        self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
 
     def draw_search(self, scr, H, W):
         s = self.search
@@ -814,6 +883,8 @@ class App:
         if not b:
             scr.put(2, 1, "bus no longer in feed"); return
         a = self.fleet.assignment(b); v, src = self.fleet.speed(b)
+        scr.put(1, 1, f"position {b.lat:.5f}, {b.lon:.5f}", "bold")
+        scr.link(1, 32, "[open in Google Maps]", maps_url(b.lat, b.lon))
         lines = [("-- raw fields from the OTD feed --", "bold")] + [(f"{k:<32} {val}", "n") for k, val in sorted(b.row.items())]
         lines += [("", "n"), ("-- derived by this app --", "bold"),
                   (f"{'route (resolved)':<32} {self.static.label(b.route_id) if b.route_id else 'NOT RESOLVED'}", "n"),
@@ -828,7 +899,7 @@ class App:
         self.scroll = min(self.scroll, max(0, len(lines) - (H - 3)))
         for i, (t, st) in enumerate(lines[self.scroll: self.scroll + H - 3]):
             scr.put(2 + i, 1, t, st)
-        self.footer(scr, H, "Up/Down scroll | Esc back")
+        self.footer(scr, H, "Up/Down scroll | g Google Maps | Esc back")
 
     def feed_census(self):
         rows = self.fleet.rows
@@ -869,7 +940,8 @@ class App:
                "  b   select next bus near centre (+)     B  deselect       Enter  all fields of selected bus",
                "  s   stop board of the stop nearest the centre             S  board for the selected bus's next stop",
                "  /   search a stop by name/id      r   show only one route (also draws its line and stops)     x  clear",
-               "  i   what fields does the feed fill, do IDs match      f  refresh now      q  quit", "",
+               "  i   what fields does the feed fill, do IDs match      f  refresh now      q  quit",
+               "  g   open the selected bus / stop / map centre in Google Maps (default browser). Or click the underlined [open in Google Maps].", "",
                "BUBBLES  (534) = bus on route 534.  o = bus whose label did not fit.  At far zoom: * one bus, 2..9 / # = many buses.",
                "         [534] highlighted = selected bus.   + in the middle = map centre.   . = bus stop (zoom in to see)", "",
                "STOP BOARD  upcoming buses sorted by ETA. ETA = distance along the route / speed. Direction 'by' tells how the app",

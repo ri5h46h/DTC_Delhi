@@ -1,0 +1,3 @@
+agency_id,agency_name,agency_url,agency_timezone,agency_lang,agency_phone,agency_fare_url,agency_email
+DTC,Delhi Transport Corporation,http://dtc.delhi.gov.in/,Asia/Kolkata,en,,,
+DOT,Department of Transport,https://transport.delhi.gov.in/,Asia/Kolkata,en,,,

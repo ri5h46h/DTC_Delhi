@@ -6,7 +6,7 @@ Needs only pandas and numpy (already installed for the collector).
 ## Run it
     python build_arrivals.py selftest                  # 1. simulated buses with known truth: how accurate is the method?
     python build_arrivals.py run                       # 2. only NEW or CHANGED days in data/clean/ (first run reads stop_times.txt: a few minutes, then cached)
-    python build_arrivals.py run --shapes              # same, but with the real road line from shapes.txt (compare the 'pings on line' % with and without)
+    python build_arrivals.py run --no-shapes           # straight lines between stops instead of the real road line (shapes.txt is the default now)
     python build_arrivals.py run --date 2026-10-11 --force --routes 2097,1957
     python build_arrivals.py show --vehicle DL51EV2595 # 3. one bus step by step: pings -> progress along route -> arrivals
 With `uv`: `uv run build_arrivals.py run`.
@@ -27,12 +27,12 @@ runs: run_id, vehicle_id, route_id, trip_id, off_route_share, t_start, t_end, n_
 
 ## Days and sessions
 * The collector writes one file per day (Indian date). Sessions on the same day are added to the SAME day file.
-* `run` only processes days that are new or whose clean file changed after the arrivals file was written. Old days are not redone (use `--force`).
+* `run` only processes days that are new, whose clean file changed, or whose settings changed (the settings of each day are saved in `<date>_settings.json`). Other days are skipped (use `--force` to redo).
 * Different sessions of one day stay apart automatically: no ping for 300 s cuts a bus's run. Each day's output is rebuilt completely (all sessions of that day).
 * Stop the collector (or wait for it to finish a poll) before running this, so the day file is not being written while it is read. If you get a read error, just run again.
 
 ## Settings
---vmax 20 (fastest believable speed in m/s for the spike filter)   --shapes   --force
+--vmax 20 (fastest believable speed in m/s for the spike filter)   --no-shapes   --force
 --on-route 100 (metres from route line)   --max-gap 120 (drop arrivals whose two pings are further apart)   --run-gap 300
 
 ## Limits to remember (put them in the report)

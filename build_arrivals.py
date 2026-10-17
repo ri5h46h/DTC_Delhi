@@ -13,10 +13,10 @@ Commands (put this file next to otd_collector.py, so the default folders 'data' 
   python build_arrivals.py selftest                     simulated buses with known truth: shows how accurate the method is
   python build_arrivals.py run                          process only NEW or CHANGED days found in data/clean/
   python build_arrivals.py run --date 2026-10-11        one day;   --force  redo days that are up to date;   --routes 2097,1957  only these route_ids
-  python build_arrivals.py run --shapes                 use the real road shape from shapes.txt instead of straight lines between stops
+  python build_arrivals.py run --no-shapes              straight lines between stops instead of the real road shape (shapes.txt is the default now)
   python build_arrivals.py show --vehicle DL1PC1234     step-by-step view of one bus (pings -> progress -> arrivals)
 """
-import argparse, math, pickle, sys, tempfile, time
+import argparse, json, math, pickle, sys, tempfile, time
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -29,6 +29,10 @@ MAX_GAP_S = 120       # arrival is only kept if the two pings around the stop ar
 VMAX = 20.0           # m/s: progress cannot jump faster than this (72 km/h) between two pings
 SLACK_M = 100         # extra metres allowed on top of that for GPS noise
 IST = 19800
+
+
+def settings(a):
+    return {"version": 2, "shapes": bool(a.shapes), "on_route": a.on_route, "max_gap": a.max_gap, "run_gap": a.run_gap, "vmax": a.vmax}
 
 
 def say(i, n, title, plain):
@@ -76,13 +80,14 @@ class Pattern:
             out.append(prev)
         return np.array(out)
 
-    def project_many(self, lat, lon, chunk=20000):
+    def project_many(self, lat, lon, chunk=None):
         """For many pings: (distance to the line in m, progress along the line in m)."""
         px, py = (lon - self.lon0) * self.kx, (lat - self.lat0) * 110540.0
         ax, ay, bx, by = self.x[:-1], self.y[:-1], self.x[1:], self.y[1:]
         dx, dy = bx - ax, by - ay
         l2 = np.where(dx * dx + dy * dy == 0, 1.0, dx * dx + dy * dy)
         dist, prog = np.empty(len(px)), np.empty(len(px))
+        chunk = chunk or max(200, int(2_000_000 / max(len(ax), 1)))      # at most about 2 million numbers per temporary array
         for s in range(0, len(px), chunk):
             X, Y = px[s:s + chunk, None], py[s:s + chunk, None]
             t = np.clip(((X - ax) * dx + (Y - ay) * dy) / l2, 0, 1)
@@ -334,6 +339,7 @@ def run_file(path, pats, a, outdir, quiet=False):
     outdir.mkdir(parents=True, exist_ok=True)
     arr.to_csv(outdir / f"{day}_arrivals.csv.gz", index=False)
     runs.to_csv(outdir / f"{day}_runs.csv.gz", index=False)
+    (outdir / f"{day}_settings.json").write_text(json.dumps(settings(a)))
     if not quiet:
         say(5, 5, "SAVE", f"writing files into {outdir}/")
         print(f"      {outdir / (day + '_arrivals.csv.gz')}  ({len(arr):,} rows)\n      {outdir / (day + '_runs.csv.gz')}  ({len(runs):,} rows)")
@@ -350,14 +356,22 @@ def cmd_run(a):
     outdir = Path(a.data) / "arrivals"
     todo = []
     for f in files:
-        out = outdir / f"{f.name.split('.')[0]}_arrivals.csv.gz"
-        if out.exists() and out.stat().st_mtime >= f.stat().st_mtime and not a.force and not a.routes:
-            print(f"skip {f.name}: arrivals are already up to date (use --force to redo)")
+        day = f.name.split('.')[0]
+        out, meta = outdir / f"{day}_arrivals.csv.gz", outdir / f"{day}_settings.json"
+        same = False
+        if meta.exists():
+            try:
+                same = json.loads(meta.read_text()) == settings(a)
+            except Exception:
+                same = False
+        if out.exists() and out.stat().st_mtime >= f.stat().st_mtime and same and not a.force and not a.routes:
+            print(f"skip {f.name}: arrivals are already up to date with the same settings (use --force to redo)")
         else:
+            why = "new day" if not out.exists() else ("data changed" if out.stat().st_mtime < f.stat().st_mtime else "different settings or older version" if not same else "forced")
+            print(f"{day}: will be processed ({why})")
             todo.append(f)
     if not todo:
         print("nothing new to process."); return
-    print(f"will process: {', '.join(f.name.split('.')[0] for f in todo)}")
     pats = load_patterns(a.gtfs, a.shapes)
     print(f"      {len(pats):,} route_ids have a usable stop list")
     for f in todo:
@@ -475,9 +489,11 @@ def main():
     ap.add_argument("--on-route", type=float, default=ON_ROUTE_M); ap.add_argument("--max-gap", type=float, default=MAX_GAP_S)
     ap.add_argument("--run-gap", type=float, default=RUN_GAP_S)
     ap.add_argument("--vmax", type=float, default=VMAX, help="fastest believable bus speed in m/s for the spike filter")
-    ap.add_argument("--shapes", action="store_true", help="use shapes.txt (real road line) instead of straight lines between stops")
+    ap.add_argument("--shapes", action="store_true", help="(default now) use shapes.txt, the real road line")
+    ap.add_argument("--no-shapes", action="store_true", help="use straight lines between stops instead of shapes.txt")
     ap.add_argument("--force", action="store_true", help="redo days whose arrivals are already up to date")
     a = ap.parse_args()
+    a.shapes = not a.no_shapes
     if a.cmd == "show" and not a.vehicle:
         raise SystemExit("show needs --vehicle VEHICLE_ID")
     {"run": cmd_run, "show": cmd_show, "selftest": cmd_selftest}[a.cmd](a)

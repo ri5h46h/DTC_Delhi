@@ -1,27 +1,20 @@
 # DTC Delhi: Live Bus Explorer, Data Collector and Arrival Detection
 
-## Setup
+Terminal tools for **Delhi buses (DTC and DIMTS cluster)**, built on the open **GTFS static** and **GTFS-Realtime** data from the Delhi **Open Transit Data (OTD)** portal.
+The goal of the project is AI/ML on top of this data: ETA prediction, anomaly detection (bunching, irregular headways) and route analytics, with an interactive dashboard at the end.
 
-    Install UV first (https://docs.astral.sh/uv/)
-    uv python install 3.10
-    uv init
-    uv add -r requirements.txt
-    uv run delhi_bus_tui.py
+> Status: work in progress. The three tools below are working and used on the live feed. The ML models and the dashboard are the next steps (see [Roadmap](#roadmap)).
+> This is an academic project (M.Tech, AI and Data Science, public transport monitoring and ETA prediction). It is **not** an official Delhi Government, DTC or DIMTS product.
 
-    or if not uv, then you can just use the basic inbuilt python-venv for creating a venv and then installing the requirements.
+## Contents
 
-1. Open `.env.example` file and paste your key into `API_KEY = "<paste your Dehi OTD API Key here>"
-`. And also rename it to `.env`
-
-2. Put your GTFS files (routes, trips, stops, stop_times .txt) in a folder called `gtfs` next to the script.
-
-3. Run `delhi_bus_tui.py`  (first run indexes stop_times.txt and saves a cache; later runs start fast).
-Try without key/files: `delhi_bus_tui.py --demo`
-
-## Keys
-arrows pan | + / - zoom | b select bus | Enter all fields | s stop board | S board of bus's next stop
-/ find stop | r route filter | x clear | i feed fields + ID match rates | f refresh | ? help | q quit
-
-Use a terminal at least 120 x 35. Windows Terminal works well.
-Tested: logic and screens offline with fake buses, and the real curses UI in a pseudo-terminal.
-NOT tested: the live download (needs your key). If it fails, the red error shows at the bottom.
+- [What is in this repo](#what-is-in-this-repo)
+- [Quick start](#quick-start)
+- [Tool 1: Live bus explorer (`delhi_bus_tui.py`)](#tool-1-live-bus-explorer-delhi_bus_tuipy)
+- [Tool 2: Data collector (`otd_collector.py`)](#tool-2-data-collector-otd_collectorpy)
+- [Tool 3: Arrival detection (`build_arrivals.py`)](#tool-3-arrival-detection-build_arrivalspy)
+- [How the tools fit together](#how-the-tools-fit-together)
+- [What we learned about the Delhi feed](#what-we-learned-about-the-delhi-feed)
+- [Troubleshooting](#troubleshooting)
+- [Security and data notes](#security-and-data-notes)
+- [Roadmap](#roadmap)

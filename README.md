@@ -72,7 +72,7 @@ The feed is requested like this (the tools do it for you): `/api/realtime/Vehicl
 
 ### 4. Get the static GTFS files
 
-1. Download the Delhi bus static data from <https://otd.delhi.gov.in/data/static>.
+1. Download the Delhi bus static data from <https://otd.delhi.gov.in/data/static>. [This mostly stays down/ or out of service], alternative reliable source for getting the most updated static gtfs data is from the Delhi Transport Stack portal <https://delhi.transportstack.in/data-services/datadetails/1>
 2. Unzip it into a folder called `gtfs/` next to the scripts. You need `routes.txt`, `trips.txt`, `stops.txt` and `stop_times.txt`. `shapes.txt` (the real road line of each route) is used by the arrival script and is recommended.
 
 Note from the OTD documentation: the times inside `stop_times.txt` are rough estimates made by assuming a constant speed. We use the file for stop lists and route lines, not for real times.
@@ -181,7 +181,7 @@ uv run delhi_bus_tui.py --refresh 15 # seconds between feed updates (the feed it
 - **Speed.** The feed's speed field is always 0, so speed is worked out from positions: straight-line distance between an older ping and the newest, divided by the time, using the oldest ping that is 20 to 180 seconds old. It is clipped to 2-14 m/s for ETA so a stopped bus does not give an infinite time.
 - **ETA (a simple baseline).** Remaining distance **along the route** (not straight line) divided by speed, plus a time for each stop in between, minus the age of the bus's last ping.
 - **Dwell.** `DWELL_S = 12` at the top of the file is a guess of seconds lost at each stop between the bus and your stop. DTC and DIMTS buses stop only when someone boards or gets off, so this can overestimate (and the speed already includes some stopping). Set `DWELL_S = 0` to see the effect. The real value is meant to be learned from data later.
-- **Empty feed answers.** The server sometimes sends an empty file. The app then keeps the last good data and shows a warning, instead of clearing the map.
+- **Empty feed answers.** The server sometimes sends an empty file. The app then keeps the last good data and shows a warning, instead of clearing the map and it also shows that how many empty feeds have been ignored so far of that particular session.
 
 The ETA is a baseline for comparison, not the final model. It will differ from the One Delhi app, which uses its own ETA method.
 
@@ -252,7 +252,7 @@ Dropped on purpose: `position.speed` (always 0), `schedule_relationship` (always
 
 ### Collecting for hours
 
-- You do **not** need 24-hour collection. Sessions of 4-5 hours work. Cover the hours that matter (morning peak about 8-11, evening peak about 17-20, some off-peak and a weekend) and write down which hours your data covers.
+- We do **not** need 24-hour collection. Sessions of 4-5 hours work. Cover the hours that matter (morning peak about 8-11, evening peak about 17-20, some off-peak and a weekend) and write down which hours your data covers.
 - On a Mac keep the laptop awake with `caffeinate`: `caffeinate -dims uv run otd_collector.py run --interval 10 --save-raw`. Plug in the charger and turn off sleep on other systems.
 - A session adds to the same day file. A new session never overwrites old data. Always start from the same project folder, otherwise a new empty `data/` is created.
 - Download size is about 0.5 MB per poll: about 90 MB of internet per hour at 20 s polling and about 180 MB per hour at 10 s. Saved data is small (about 15 MB per hour).
@@ -353,7 +353,7 @@ delhi_bus_tui.py  ◄── live feed + gtfs/  (for looking at the live data)
 
 ## What we learned about the Delhi feed
 
-Observations from the author's own samples (October 2026). They may change over time, so check them on your data (the `i` screen of the explorer and `otd_collector.py inspect` show these numbers).
+Observations from my own initial samples (ran the collector for 40 minutes, October 2026). They may change over time, so check them on your data (the `i` screen of the explorer and `otd_collector.py inspect` show these numbers).
 
 - About 4,900 vehicles in the feed at once. The vehicle id is the number plate.
 - Filled fields: position, timestamp, `route_id`, `trip_id`, `start_date`, `start_time`. **Speed is always 0.** There is no bearing, stop or occupancy field.

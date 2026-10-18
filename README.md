@@ -1,4 +1,4 @@
-# Delhi Live Bus Explorer TUI App (terminal app)
+# DTC Delhi: Live Bus Explorer, Data Collector and Arrival Detection
 
 ## Setup
 

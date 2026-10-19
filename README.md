@@ -1,4 +1,4 @@
-# DTC Delhi: Live Bus Explorer, Data Collector and Arrival Detection
+# DTC Delhi: Live Bus Explorer, Data Collector and Arrival Detection [Work in Progress]
 
 Terminal tools for **Delhi buses (DTC and DIMTS cluster)**, built on the open **GTFS static** and **GTFS-Realtime** data from the Delhi **Open Transit Data (OTD)** portal.
 The goal of the project is AI/ML on top of this data: ETA prediction, anomaly detection (bunching, irregular headways) and route analytics, with an interactive dashboard at the end.

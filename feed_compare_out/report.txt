@@ -1,0 +1,310 @@
+
+====================================================================================================
+COMPARING THE TWO LIVE BUS FEEDS OF DELHI
+====================================================================================================
+  Both feeds give a GTFS-Realtime VehiclePositions file: one entry per bus with its position and
+  some details. This script downloads both, reads every field, and shows what each feed has and
+  what it does not have. Names used below: OTD = otd.delhi.gov.in, TStack = Delhi Transport Stack.
+
+====================================================================================================
+1. DOWNLOAD
+====================================================================================================
+  poll 1/4 OTD Delhi: ok 367,730 bytes in 0.51 s
+  poll 1/4 Delhi Transport Stack: ok 388,504 bytes in 0.43 s
+  poll 2/4 OTD Delhi: ok 367,730 bytes in 0.31 s
+  poll 2/4 Delhi Transport Stack: ok 388,504 bytes in 0.48 s
+  poll 3/4 OTD Delhi: ok 367,730 bytes in 0.34 s
+  poll 3/4 Delhi Transport Stack: ok 388,504 bytes in 0.51 s
+  poll 4/4 OTD Delhi: ok 370,383 bytes in 0.32 s
+  poll 4/4 Delhi Transport Stack: ok 391,276 bytes in 0.57 s
+  OTD Delhi: HTTP 200, 370,383 bytes, 0.32 s
+      content-type: application/octet-stream
+      content-length: 370383
+      last-modified: Mon, 19 Oct 2026 01:41:29 GMT
+      etag: "6ad57549-5a6cf"
+      date: Mon, 19 Oct 2026 01:41:32 GMT
+      server: nginx/1.18.0 (Ubuntu)
+  Delhi Transport Stack: HTTP 200, 391,276 bytes, 0.57 s
+      content-type: application/octet-stream
+      content-length: 391276
+      date: Mon, 19 Oct 2026 01:41:32 GMT
+      server: gunicorn
+  self-check OTD: this script found 3,573 vehicles, the official library found 3,573  (same)
+  self-check TStack: this script found 3,573 vehicles, the official library found 3,573  (same)
+
+====================================================================================================
+2. FEED HEADER AND ENTITY TYPES
+====================================================================================================
+  The header says which version of the format is used and when the whole file was made. Entity
+  types: a feed can hold vehicle positions, trip updates (predicted arrival times per stop) and
+  alerts.
+  feed    version  incrementality  file made at             entities  vehicles  trip_updates  alerts
+  ------  -------  --------------  -----------------------  --------  --------  ------------  ------
+  OTD     2.0      FULL_DATASET    07:11:29 IST (4 s old)   3573      3573      0             0     
+  TStack  2.0      FULL_DATASET    07:11:10 IST (23 s old)  3573      3573      0             0     
+
+====================================================================================================
+3. HOW FRESH IS THE DATA
+====================================================================================================
+  Each bus has its own timestamp. 'Age' = download time minus that timestamp. Old pings mean the
+  bus has stopped reporting.
+  feed    buses with time  median age  90th pct age  oldest  older than 5 min  time in the future
+  ------  ---------------  ----------  ------------  ------  ----------------  ------------------
+  OTD     3573             22 s        100 s         423 s   0%                0%                
+  TStack  3573             38 s        161 s         454 s   0%                0%                
+
+  Update behaviour over the polls (how many buses got a NEW timestamp between two polls):
+  OTD: 4 good polls of 4; vehicles count 3,548-3,573; header time changed in 3/3 steps; share of buses with a newer ping per step: 80%, 0%, 96%
+  TStack: 4 good polls of 4; vehicles count 3,548-3,573; header time changed in 2/3 steps; share of buses with a newer ping per step: 96%, 0%, 81%
+
+====================================================================================================
+4. WHICH FIELDS DOES EACH FEED HAVE?
+====================================================================================================
+  Every field found in the vehicle entries. 'present' = share of buses that have the field. 'zero'
+  = share of those values that are 0 (a field that is always 0 carries no information). 'distinct'
+  = how many different values appear.
+  field                       OTD present  zero  distinct  TStack present  zero  distinct  example                       
+  --------------------------  -----------  ----  --------  --------------  ----  --------  ------------------------------
+  position.latitude           100%         0%    3501      100%            0%    3492      28.825472, 28.502811          
+  position.longitude          100%         0%    3387      100%            0%    3390      76.983955, 77.179573          
+  position.speed              100%         100%  1         100%            7%    3073      3.451363, 15.393193           
+  timestamp                   100%         0%    170       100%            0%    190       1792374074, 1792374063        
+  trip.route_id               100%               1141      100%                  1141      1529, 3062                    
+  trip.schedule_relationship  100%               2         100%                  2         ADDED, SCHEDULED              
+  trip.start_date             100%               7         100%                  7         20261019, 20261018            
+  trip.start_time             100%               311       100%                  634       07:05:24, 07:08:59            
+  trip.trip_id                100%               3513      100%                  3573      1529_07_05_9966, 3062_07_08_62
+  vehicle.id                  100%               3573      100%                  3573      DL51EV0534, DL1PD8718         
+  vehicle.label               100%               3573      100%                  3573      DL51EV0534, DL1PD8718         
+
+  Standard GTFS-Realtime vehicle fields that NEITHER feed has: trip.direction_id,
+  trip.modified_trip, position.bearing, position.odometer, current_stop_sequence, current_status,
+  congestion_level, stop_id, vehicle.license_plate, vehicle.wheelchair_accessible,
+  occupancy_status, occupancy_percentage, multi_carriage_details.
+
+====================================================================================================
+5. EXTRA FIELDS THAT ARE NOT IN THE STANDARD FORMAT
+====================================================================================================
+  If a feed carries fields that the standard GTFS-Realtime format does not define, they show up
+  here with their field number and some example values. This is where 'extra information' of a
+  feed would hide.
+  none: both feeds only use standard GTFS-Realtime fields.
+
+====================================================================================================
+6. THE FIELDS THAT MATTER FOR THIS PROJECT
+====================================================================================================
+  field                  OTD       TStack    why it matters                                                
+  ---------------------  --------  --------  --------------------------------------------------------------
+  position.latitude      yes 100%  yes 100%  Where the bus is. Needed for everything.                      
+  position.longitude     yes 100%  yes 100%  Where the bus is. Needed for everything.                      
+  timestamp              yes 100%  yes 100%  When the bus device recorded the position. Needed to know how 
+  position.speed         always 0  yes 100%  Speed reported by the bus (metres per second). If it is always
+  position.bearing       missing   missing   Direction the bus faces (degrees). Helps to decide UP/DOWN and
+  position.odometer      missing   missing   Distance travelled by the bus. Would give exact distance betwe
+  trip.route_id          yes 100%  yes 100%  Which route (in Delhi one route_id = one direction of a route)
+  trip.trip_id           yes 100%  yes 100%  Which scheduled trip. Useful only if it matches the static tim
+  trip.direction_id      missing   missing   Direction 0/1 of the trip.                                    
+  trip.start_time        yes 100%  yes 100%  Start time of the trip.                                       
+  trip.start_date        yes 100%  yes 100%  Service day of the trip.                                      
+  vehicle.id             yes 100%  yes 100%  Stable id to follow one bus over time.                        
+  vehicle.license_plate  missing   missing   Number plate (another way to identify the bus).               
+  stop_id                missing   missing   Stop the bus is at / heading to. Would give stop progress with
+  current_stop_sequence  missing   missing   Position of that stop in the trip.                            
+  current_status         missing   missing   IN_TRANSIT_TO / STOPPED_AT / INCOMING_AT. STOPPED_AT would sho
+  occupancy_status       missing   missing   How full the bus is.                                          
+  occupancy_percentage   missing   missing   How full the bus is, in percent.                              
+  congestion_level       missing   missing   Traffic around the bus.                                       
+
+  Meaning of the entries: 'yes' = the field is filled and varies. 'missing' = not in the feed.
+  'always 0' / 'empty' / 'constant' = the field exists but carries no information.
+
+====================================================================================================
+7. DO THE FEEDS DESCRIBE THE SAME BUSES?
+====================================================================================================
+  Buses are matched by id. The script tries every pair of id fields (vehicle.id, vehicle.label,
+  vehicle.license_plate, entity id) and uses the pair with most buses in common.
+  OTD buses: 3,573   TStack buses: 3,573
+  example ids in OTD: ['DL51EV2592', 'DL51EV0534', 'DL1PD4369', 'DL1PD9174']
+  example ids in TStack: ['DL51EV0534', 'DL1PD8718', 'DL1PD7602', 'DL1PD9773']
+  best match: OTD 'vehicle.id' = TStack 'vehicle.id'. In both: 3,573  | only in OTD: 0  | only in TStack: 0
+  So TStack has 100% of the OTD buses, and OTD has 100% of the TStack buses.
+  distance between the two positions of the same bus: median 61 m, 90th pct 265 m, largest 2,990 m
+  timestamp difference (TStack minus OTD): median -11 s | TStack newer for 0%, same for 6%, older for 94%
+  A positive difference means TStack has a newer ping of that bus. (The two downloads are about a
+  second apart, so small differences are normal.)
+
+  fields that exist in both feeds: do the values agree for the same bus?
+  field                       buses compared  same value
+  --------------------------  --------------  ----------
+  position.speed              3573            7%        
+  trip.route_id               3573            100%      
+  trip.schedule_relationship  3573            77%       
+  trip.start_date             3573            100%      
+  trip.start_time             3573            3%        
+  trip.trip_id                3573            0%        
+  vehicle.id                  3573            100%      
+  vehicle.label               3573            100%      
+  A low 'same value' means the two feeds use different formats for that field (for example
+  different route ids). Look at the samples in section 9.
+
+====================================================================================================
+8. DO THE IDS MATCH YOUR STATIC GTFS FILES?
+====================================================================================================
+  Share of the feed's ids that exist in your static GTFS (OTD static data). If the Transport Stack
+  feed uses ids from a different static dataset, a low number here means you also need its static
+  files.
+  id field       OTD matches    TStack matches
+  -------------  -------------  --------------
+  trip.route_id  100% of 3,573  100% of 3,573 
+  trip.trip_id   5% of 3,573    0% of 3,573   
+  stop_id        field missing  field missing 
+
+====================================================================================================
+9. SAMPLE DATA
+====================================================================================================
+  The first buses of each feed with all their fields, then the same bus from both feeds side by
+  side (a * marks a different value).
+
+  --- OTD Delhi: first 3 buses ---
+  bus 1:
+      entity_id                  DL51EV2592
+      position.latitude              28.625259
+      position.longitude             77.240631
+      position.speed                 0.000000
+      timestamp                  1792374091
+      trip.route_id              2213
+      trip.schedule_relationship SCHEDULED
+      trip.start_date            20261019
+      trip.start_time            06:41:18
+      trip.trip_id               2213_06_15
+      vehicle.id                 DL51EV2592
+      vehicle.label              DL51EV2592
+  bus 2:
+      entity_id                  DL51EV0534
+      position.latitude              28.824743
+      position.longitude             76.982994
+      position.speed                 0.000000
+      timestamp                  1792374085
+      trip.route_id              1529
+      trip.schedule_relationship ADDED
+      trip.start_date            20261019
+      trip.start_time            07:05:24
+      trip.trip_id               1529_7_5
+      vehicle.id                 DL51EV0534
+      vehicle.label              DL51EV0534
+  bus 3:
+      entity_id                  DL1PD4369
+      position.latitude              28.569571
+      position.longitude             77.189964
+      position.speed                 0.000000
+      timestamp                  1792374079
+      trip.route_id              2189
+      trip.schedule_relationship ADDED
+      trip.start_date            20261019
+      trip.start_time            06:20:29
+      trip.trip_id               2189_6_20
+      vehicle.id                 DL1PD4369
+      vehicle.label              DL1PD4369
+
+  --- Delhi Transport Stack: first 3 buses ---
+  bus 1:
+      entity_id                  DL51EV0534
+      position.latitude              28.825472
+      position.longitude             76.983955
+      position.speed                 3.451363
+      timestamp                  1792374074
+      trip.route_id              1529
+      trip.schedule_relationship ADDED
+      trip.start_date            20261019
+      trip.start_time            07:05:24
+      trip.trip_id               1529_07_05_9966
+      vehicle.id                 DL51EV0534
+      vehicle.label              DL51EV0534
+  bus 2:
+      entity_id                  DL1PD8718
+      position.latitude              28.502811
+      position.longitude             77.179573
+      position.speed                 15.393193
+      timestamp                  1792374063
+      trip.route_id              3062
+      trip.schedule_relationship ADDED
+      trip.start_date            20261019
+      trip.start_time            07:08:59
+      trip.trip_id               3062_07_08_6209
+      vehicle.id                 DL1PD8718
+      vehicle.label              DL1PD8718
+  bus 3:
+      entity_id                  DL1PD7602
+      position.latitude              28.618105
+      position.longitude             77.279793
+      position.speed                 15.638077
+      timestamp                  1792374063
+      trip.route_id              2885
+      trip.schedule_relationship ADDED
+      trip.start_date            20261019
+      trip.start_time            05:51:25
+      trip.trip_id               2885_05_51_3175
+      vehicle.id                 DL1PD7602
+      vehicle.label              DL1PD7602
+
+  --- same bus in both feeds (first 3) ---
+  bus DL1PD4102
+      field                      OTD                      TStack                  
+      entity_id                      DL1PD4102                DL1PD4102               
+    * position.latitude              28.561844                28.561861               
+    * position.longitude             77.072708                77.072678               
+    * position.speed                 0.000000                 14.510905               
+    * timestamp                      1792374067               1792374056              
+      trip.route_id                  686                      686                     
+      trip.schedule_relationship     ADDED                    ADDED                   
+      trip.start_date                20261019                 20261019                
+    * trip.start_time                07:00:17                 07:00:33                
+    * trip.trip_id                   686_7_0                  686_07_00_7579          
+      vehicle.id                     DL1PD4102                DL1PD4102               
+      vehicle.label                  DL1PD4102                DL1PD4102               
+  bus DL1PD4124
+      field                      OTD                      TStack                  
+      entity_id                      DL1PD4124                DL1PD4124               
+    * position.latitude              28.620926                28.621122               
+    * position.longitude             77.205650                77.205368               
+    * position.speed                 0.000000                 8.400148                
+    * timestamp                      1792374068               1792374057              
+      trip.route_id                  2203                     2203                    
+      trip.schedule_relationship     ADDED                    ADDED                   
+      trip.start_date                20261019                 20261019                
+    * trip.start_time                06:26:38                 06:26:26                
+    * trip.trip_id                   2203_6_26                2203_06_26_9974         
+      vehicle.id                     DL1PD4124                DL1PD4124               
+      vehicle.label                  DL1PD4124                DL1PD4124               
+  bus DL1PD4126
+      field                      OTD                      TStack                  
+      entity_id                      DL1PD4126                DL1PD4126               
+    * position.latitude              28.585545                28.583426               
+    * position.longitude             77.146362                77.145836               
+    * position.speed                 0.000000                 3.482785                
+    * timestamp                      1792374076               1792374054              
+      trip.route_id                  2203                     2203                    
+      trip.schedule_relationship     ADDED                    ADDED                   
+      trip.start_date                20261019                 20261019                
+    * trip.start_time                06:52:36                 06:52:10                
+    * trip.trip_id                   2203_6_52                2203_06_52_9459         
+      vehicle.id                     DL1PD4126                DL1PD4126               
+      vehicle.label                  DL1PD4126                DL1PD4126               
+
+====================================================================================================
+10. SUMMARY: WHAT THE TWO FEEDS GIVE
+====================================================================================================
+  Fields only in OTD: none
+  Fields only in TStack: none
+  Fields in both: position.latitude, position.longitude, position.speed, timestamp, trip.route_id,
+  trip.schedule_relationship, trip.start_date, trip.start_time, trip.trip_id, vehicle.id,
+  vehicle.label
+  Fields that carry real information in TStack but not in OTD: position.speed
+
+  What this means for the project:
+    - TStack gives a real speed value: use it directly (and compare with the speed worked out from
+    positions).
+
+  Next steps: (1) run this once during peak hours and once at night, the answer can differ. (2)
+  Run with --polls 4 --interval 15 to compare how often each feed changes. (3) If TStack has
+  fields or buses that OTD lacks, we can add it as a second source to the collector.

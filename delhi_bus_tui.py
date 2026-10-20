@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ========================= CONFIG (edit these) =========================
-TRANSPORT_STACK_API_KEY = os.getenv("TRANSPORT_STACK_API_KEY")   # <-- paste your Delhi Transport Stack key (default feed)
+TSTACK_API_KEY = os.getenv("TSTACK_API_KEY")   # <-- paste your Delhi Transport Stack key (default feed)
 OTD_API_KEY = os.getenv("OTD_API_KEY")                    # <-- paste your OTD Delhi key (--using-otd, and as the fallback feed)
 GTFS_DIR = "gtfs"                        # folder with routes.txt, trips.txt, stops.txt, stop_times.txt
 TSTACK_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"      # key goes in the x-api-key header
@@ -387,7 +387,7 @@ class LiveSource:
             who = "OTD (OTD_API_KEY)"
         else:
             r = requests.get(TSTACK_URL, params=TSTACK_PARAMS, headers={"x-api-key": self.key}, timeout=20)
-            who = "Transport Stack (TRANSPORT_STACK_API_KEY)"
+            who = "Transport Stack (TSTACK_API_KEY)"
         if r.status_code in (401, 403):
             raise RuntimeError(f"HTTP {r.status_code}: the {who} key was rejected. Check the key at the top of delhi_bus_tui.py.")
         if r.status_code == 429:
@@ -1113,7 +1113,7 @@ def main():
     ap.add_argument("--gtfs", default=GTFS_DIR)
     ap.add_argument("--refresh", type=int, default=REFRESH_SECONDS)
     a = ap.parse_args()
-    keys = {"otd": OTD_API_KEY, "tstack": TRANSPORT_STACK_API_KEY}
+    keys = {"otd": OTD_API_KEY, "tstack": TSTACK_API_KEY}
     name = "otd" if a.using_otd else "tstack"
     label = LABEL[name] + (" demo" if a.demo else "")
     fleet = None
@@ -1122,7 +1122,7 @@ def main():
         fleet = Fleet(static, name, label, a.eta_speed)
     else:
         if not key_ok(keys[name]):
-            var = "OTD_API_KEY" if a.using_otd else "TRANSPORT_STACK_API_KEY"
+            var = "OTD_API_KEY" if a.using_otd else "TSTACK_API_KEY"
             raise SystemExit(f"Paste your {LABEL[name]} API key into {var} at the top of delhi_bus_tui.py." + ("" if a.using_otd else "  (To use the OTD feed instead, run with --using-otd.)"))
         other = "tstack" if a.using_otd else "otd"
         use_fb = (not a.no_fallback) and key_ok(keys[other])

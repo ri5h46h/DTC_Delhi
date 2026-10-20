@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-OTD Live Collector - collects Delhi bus GPS data and cleans it, while SHOWING what it does.
+OTD Live Collector (version 2) - collects Delhi bus GPS data and cleans it, while SHOWING what it does.
+
+MAIN FEED   Delhi Transport Stack (has a real speed value).
+FALLBACK    OTD Delhi (no speed). Only ONE feed is called per poll. After 2 problems in a row the other feed is used,
+            and every 4th poll the main feed is tried once to see if it works again.
 
 Every poll goes through 5 visible steps:
-   1 FETCH     download the live file from the OTD server
+   1 FETCH     download the live file from ONE feed
    2 DECODE    turn the binary (protobuf) file into one row per bus
    3 VALIDATE  check every row: drop unusable ones (with a reason), flag suspicious ones
    4 SAVE      append the new, valid pings to today's file in data/clean/
    5 HEALTH    write one line about this poll to data/health/ (feed reliability record)
 
 Commands:
-   python otd_collector.py run              live dashboard (keys: p pause, f fetch now, +/- speed, e explain, q quit)
-   python otd_collector.py run --plain      same steps printed as readable text (good for a server / log file)
-   python otd_collector.py run --demo       fake feed, no API key needed (to learn how it works)
-   python otd_collector.py inspect          summary of the data collected so far
+   python otd_collector.py run                  live dashboard (keys: p pause, f fetch now, +/- speed, e explain, q quit)
+   python otd_collector.py run --plain          same steps printed as readable text (good for a server / log file)
+   python otd_collector.py run --save-raw       also keep every untouched download in data/raw/
+   python otd_collector.py run --using-otd      OTD as the main feed (Transport Stack becomes the fallback)
+   python otd_collector.py run --no-fallback    never switch feeds
+   python otd_collector.py run --demo           fake feeds, no API keys needed (shows the fallback too)
+   python otd_collector.py inspect              summary of the data collected so far
 """
-import argparse, csv, curses, gzip, math, os, random, re, sys, threading, time
+import argparse, csv, curses, gzip, json, math, os, random, re, sys, threading, time
 from collections import Counter, deque
 from pathlib import Path
 import os
@@ -24,12 +31,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================ CONFIG (edit these) ============================
-API_KEY = os.getenv("API_KEY")     # <-- paste your OTD key (or set env var OTD_API_KEY)
+TSTACK_API_KEY = os.getenv("TSTACK_API_KEY")   # <-- paste your Delhi Transport Stack key (main feed)
+OTD_API_KEY = os.getenv("OTD_API_KEY")                    # <-- paste your OTD Delhi key (fallback feed, or main with --using-otd)
 GTFS_DIR = "gtfs"                       # optional: routes.txt + trips.txt, used only to flag ID matches
 DATA_DIR = "data"
-BASE_URL = "https://otd.delhi.gov.in"
-RT_PATH = "/api/realtime/VehiclePositions.pb"
-INTERVAL = 20                           # seconds between polls (the feed itself refreshes about every 10 s)
+TSTACK_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"       # key goes in the x-api-key header
+TSTACK_PARAMS = {"agency": "delhi-buses", "category": "realtime_gtfs", "filename": "VehiclePositions.pb"}
+OTD_URL = "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb"              # key goes in the URL (?key=...)
+INTERVAL = 15                           # seconds between polls (the feeds update in bursts, see 'inspect')
 MIN_INTERVAL = 10
 BBOX = (28.20, 29.10, 76.60, 77.70)     # lat_min, lat_max, lon_min, lon_max  (Delhi-NCR, generous)
 MAX_AGE_S = 600                         # ping older than this is "not live" -> dropped
@@ -37,13 +46,16 @@ JUMP_KMH = 100                          # implied speed above this -> row is FLA
 IST = 19800                             # seconds; file dates and hours use Indian time
 # ==============================================================================
 
-COLUMNS = ["fetched_at", "ts", "vehicle_id", "route_id", "trip_id", "start_date", "start_time", "lat", "lon",
-           "age_s", "dt_s", "moved_m", "speed_kmh", "flag", "trip_in_static", "route_in_static",
-           "bearing", "stop_id", "stop_seq", "occupancy"]
-HEALTH_COLUMNS = ["fetched_at", "http_status", "latency_s", "bytes", "vehicles_in_feed", "feed_age_s", "rows_saved",
-                  "duplicate", "stale", "outside_area", "bad_row", "flag_gps_jump", "error"]
+LABEL = {"tstack": "Transport Stack", "otd": "OTD"}
+COLUMNS = ["fetched_at", "source", "ts", "vehicle_id", "route_id", "trip_id", "start_date", "start_time", "schedule",
+           "lat", "lon", "speed_ms", "age_s", "dt_s", "moved_m", "speed_calc_kmh", "flag", "trip_in_static", "route_in_static", "extra"]
+HEALTH_COLUMNS = ["fetched_at", "source", "http_status", "latency_s", "bytes", "vehicles_in_feed", "feed_age_s", "rows_saved",
+                  "duplicate", "stale", "outside_area", "bad_row", "flag_gps_jump", "speed_present_pct", "speed_zero_pct", "event", "error"]
+# fields the collector knows. Anything else the feed sends is kept in the 'extra' column (so nothing is lost silently).
+KNOWN = {"vehicle.id", "trip.route_id", "trip.trip_id", "trip.start_date", "trip.start_time", "trip.schedule_relationship",
+         "position.latitude", "position.longitude", "position.speed", "timestamp", "entity_id"}
 REASONS = {
-    "duplicate": "bus has not sent a new position since the last poll (normal, most buses)",
+    "duplicate": "bus has not sent a new position since the last poll (normal, most rows)",
     "stale": f"last ping is older than {MAX_AGE_S} s (bus not live: parked / GPS off)",
     "outside_area": "position outside the Delhi-NCR box (bad GPS)",
     "no_position": "row has no latitude/longitude",
@@ -51,12 +63,13 @@ REASONS = {
     "future_time": "timestamp is in the future (clock error)",
 }
 EXPLAIN = {
-    "FETCH": "Downloads the live file from the OTD server (the same data the apps use).",
+    "FETCH": "Downloads the live file from ONE feed (Transport Stack, or OTD while it is the fallback).",
     "DECODE": "The file is protobuf (binary). We turn it into one table row per bus.",
     "VALIDATE": "Each row is checked. Unusable rows are dropped with a reason; suspicious ones are only flagged.",
     "SAVE": "New valid pings are appended to today's compressed CSV in data/clean/.",
-    "HEALTH": "One line per poll goes to data/health/ so we can measure how reliable the feed is.",
+    "HEALTH": "One line per poll goes to data/health/ so we can measure how reliable the feeds are.",
 }
+SECRETS = []
 
 
 class FeedError(Exception):
@@ -64,8 +77,14 @@ class FeedError(Exception):
 
 
 def redact(text):
-    """Remove the API key from any error text before it is shown or saved."""
+    for k in SECRETS:
+        if k and len(k) > 4:
+            text = str(text).replace(k, "***")
     return re.sub(r"(key=)[^&\s'\")]+", r"\1***", str(text))
+
+
+def key_ok(k):
+    return bool(k) and not str(k).startswith("PASTE")
 
 
 def to_float(x):
@@ -101,23 +120,36 @@ def flatten(d, prefix=""):
 
 # ============================ DATA SOURCES ============================
 class LiveSource:
-    def __init__(self, key):
-        self.key = key
+    """One real feed. source = "tstack" (key in the x-api-key header) or "otd" (key in the URL)."""
+    def __init__(self, source, key):
+        self.source, self.key = source, key
+        SECRETS.append(key)
 
-    def fetch(self):
+    def http_get(self):
         import requests
-        from google.transit import gtfs_realtime_pb2
-        from google.protobuf.json_format import MessageToDict
         t0 = time.time()
-        r = requests.get(BASE_URL + RT_PATH, params={"key": self.key}, timeout=25)
+        if self.source == "otd":
+            r = requests.get(OTD_URL, params={"key": self.key}, timeout=25)
+            who = "OTD (OTD_API_KEY)"
+        else:
+            r = requests.get(TSTACK_URL, params=TSTACK_PARAMS, headers={"x-api-key": self.key}, timeout=25)
+            who = "Transport Stack (TSTACK_API_KEY)"
         latency = time.time() - t0
         if r.status_code in (401, 403):
-            raise FeedError(f"HTTP {r.status_code}: the server rejected the API key. Check API_KEY.")
+            raise FeedError(f"HTTP {r.status_code}: the {who} key was rejected. Check the key at the top of otd_collector.py.")
         if r.status_code == 429:
             raise FeedError("HTTP 429: too many requests. Slow down (press - on the dashboard).")
         r.raise_for_status()
+        if r.content[:1] in (b"{", b"<", b"["):
+            raise FeedError("the server sent text instead of a feed: " + redact(r.content[:100].decode("utf-8", "replace")))
+        return r.content, r.status_code, latency
+
+    def fetch(self):
+        from google.transit import gtfs_realtime_pb2
+        from google.protobuf.json_format import MessageToDict
+        content, status, latency = self.http_get()
         feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(r.content)
+        feed.ParseFromString(content)
         rows = []
         for e in feed.entity:
             if e.HasField("vehicle"):
@@ -125,35 +157,75 @@ class LiveSource:
                 row["entity_id"] = e.id
                 rows.append(row)
         hts = feed.header.timestamp if feed.header.HasField("timestamp") else None
-        return {"rows": rows, "status": r.status_code, "bytes": len(r.content), "latency": latency, "header_ts": hts, "raw": r.content}
+        return {"rows": rows, "status": status, "bytes": len(content), "latency": latency, "header_ts": hts, "raw": content}
+
+
+class FeedManager:
+    """Calls ONE feed per poll; the other feed is only a fallback.
+    - 2 problems in a row on the active feed (error, rejected key, empty or tiny file) -> switch to the other feed
+    - while on the fallback, every 4th poll the main feed is tried once; if it works the manager switches back."""
+    def __init__(self, primary, sources):
+        self.primary = primary
+        self.other = "tstack" if primary == "otd" else "otd"
+        self.sources = sources                       # {"tstack": source, "otd": source}  (the other one may be missing)
+        self.active, self.trying, self.fails, self.fb_cycles = primary, primary, 0, 0
+        self.just_switched, self.note = False, ""
+
+    def fetch(self):
+        name = self.active
+        if self.active != self.primary:
+            self.fb_cycles += 1
+            if self.fb_cycles % 4 == 0:
+                name = self.primary                  # a quick check whether the main feed works again
+        self.trying = name
+        f = self.sources[name].fetch()               # problems are raised as errors
+        f["source"] = name
+        return f
+
+    def mark(self, ok):
+        name = self.trying
+        if ok:
+            if name == self.primary and self.active != self.primary:
+                self.active, self.just_switched, self.note = self.primary, True, f"{LABEL[self.primary]} works again, switched back to it."
+            self.fails = 0
+            return
+        if name != self.active:                      # a failed check of the main feed: stay on the fallback
+            return
+        self.fails += 1
+        if self.fails >= 2 and len(self.sources) > 1:
+            old, self.active = self.active, (self.other if self.active == self.primary else self.primary)
+            self.fails, self.fb_cycles, self.just_switched = 0, 0, True
+            self.note = f"{LABEL[old]} had problems, now using {LABEL[self.active]}."
+
+    def state_text(self):
+        if self.active == self.primary:
+            return f"{LABEL[self.active]} (main)" + ("" if len(self.sources) > 1 else ", no fallback")
+        return f"{LABEL[self.active]} (FALLBACK, {LABEL[self.primary]} had problems)"
 
 
 class FakeSource:
-    """Pretend feed that contains every kind of problem, so you can see the cleaning work."""
-    def __init__(self, n=400):
-        random.seed(1)
-        self.buses = [{"id": f"DL1PC{1000 + i}", "route": random.choice(["534", "425", "1707", "DL7"]),
-                       "lat": random.uniform(28.50, 28.75), "lon": random.uniform(77.05, 77.30),
-                       "ts": 0, "alive": random.random() > 0.05} for i in range(n)]
-        self.n = 0
+    """Pretend feed with every kind of problem, so you can see the cleaning work. 'tstack' has speed, 'otd' sends 0."""
+    def __init__(self, name, buses):
+        self.name, self.buses, self.n = name, buses, 0
 
     def fetch(self):
         self.n += 1
         now = time.time()
-        if self.n % 7 == 0:
-            raise FeedError("simulated network problem (demo)")
+        if self.name == "tstack" and self.n in (4, 5):
+            raise FeedError("simulated Transport Stack outage (demo)")
         rows = []
-        if self.n % 9 != 0:                                   # every 9th poll the demo feed is empty
+        if self.n % 9 != 0:                                   # every 9th call this feed answers with an empty file
+            lag = 11 if self.name == "tstack" else 0
             for b in self.buses:
                 if b["alive"] and random.random() < 0.45:     # only some buses send a new ping each poll
                     b["lat"] += random.uniform(-0.001, 0.001); b["lon"] += random.uniform(-0.001, 0.001)
-                    b["ts"] = int(now - random.randint(0, 15))
+                    b["ts"] = int(now - random.randint(0, 15) - lag); b["v"] = random.choice([0.0, 3.2, 6.1, 8.9, 12.4])
                 elif not b["ts"]:
                     b["ts"] = int(now - 5000)                 # dead bus: very old ping
                 row = {"entity_id": b["id"], "vehicle.id": b["id"], "vehicle.label": b["id"],
                        "trip.route_id": b["route"], "trip.trip_id": f"{b['route']}_16_20",
                        "trip.start_date": ist_date(now).replace("-", ""), "trip.start_time": "16:13:46",
-                       "trip.schedule_relationship": "SCHEDULED", "position.speed": 0.0,
+                       "trip.schedule_relationship": b["sched"], "position.speed": (b.get("v", 0.0) if self.name == "tstack" else 0.0),
                        "position.latitude": b["lat"], "position.longitude": b["lon"], "timestamp": str(b["ts"])}
                 rows.append(row)
             if len(rows) > 10:
@@ -161,9 +233,16 @@ class FakeSource:
                 rows[5]["position.latitude"] = 19.07; rows[5]["position.longitude"] = 72.87   # Mumbai!
                 del rows[7]["position.latitude"]
                 rows[9]["position.latitude"] += 0.5                                           # GPS jump (flag)
+                rows[11]["position.bearing"] = 90.0                                           # an unexpected field -> goes to 'extra'
         time.sleep(0.3)
-        return {"rows": rows, "status": 200, "bytes": 250 * len(rows), "latency": 0.3, "header_ts": int(now) - 4,
+        return {"rows": rows, "status": 200, "bytes": 250 * len(rows), "latency": 0.3, "header_ts": int(now) - 4 - (19 if self.name == "tstack" else 0),
                 "raw": ("\n".join(str(r) for r in rows)).encode()}
+
+
+def demo_buses(n=400):
+    random.seed(1)
+    return [{"id": f"DL1PC{1000 + i}", "route": random.choice(["534UP", "425DOWN", "1707", "DL7"]), "sched": random.choice(["ADDED", "ADDED", "SCHEDULED"]),
+             "lat": random.uniform(28.50, 28.75), "lon": random.uniform(77.05, 77.30), "ts": 0, "alive": random.random() > 0.05} for i in range(n)]
 
 
 def load_static(folder):
@@ -177,17 +256,34 @@ def load_static(folder):
 
 
 # ============================ THE PIPELINE ============================
+def header_ok(path, columns):
+    """True if the first line of the (gz) csv file is exactly our column list."""
+    try:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            return fh.readline().strip() == ",".join(columns)
+    except Exception:
+        return False
+
+
+def check_formats(data_dir):
+    """Refuse to add rows to a file of today that was written by an older collector (the columns would not line up)."""
+    d, now = Path(data_dir), time.time()
+    for path, cols in ((d / "clean" / f"{ist_date(now)}.csv.gz", COLUMNS), (d / "health" / f"{ist_date(now)}.csv", HEALTH_COLUMNS)):
+        if path.exists() and not header_ok(path, cols):
+            raise SystemExit(f"{path} has the column layout of an older collector. Rename the whole '{data_dir}' folder (for example to '{data_dir}_old') and start again.")
+
+
 class Collector:
-    def __init__(self, source, static, data_dir, interval, save_raw=False):
-        self.source, self.static, self.dir = source, static, Path(data_dir)
-        self.save_raw = save_raw
-        self.interval = interval
+    def __init__(self, feeds, static, data_dir, interval, save_raw=False):
+        self.feeds, self.static, self.dir, self.interval, self.save_raw = feeds, static, Path(data_dir), interval, save_raw
         self.last_seen = {}                       # vehicle_id -> (ts, lat, lon) of last SAVED ping
         self.events = deque(maxlen=300)
         self.report = None
-        self.counts = deque(maxlen=10)
+        self.counts = {"tstack": deque(maxlen=10), "otd": deque(maxlen=10)}      # typical vehicle count of each feed
         self.t_start = time.time()
         self.stats = {"polls": 0, "ok": 0, "failed": 0, "empty": 0, "saved": 0, "bytes": 0, "cycles_bytes": 0}
+        self.rows_by_source, self.polls_by_source = Counter(), Counter()
         self.rejects, self.flags, self.vehicles = Counter(), Counter(), set()
         self.paused, self.stop, self.force = False, False, False
         self.wake = threading.Event()
@@ -200,7 +296,7 @@ class Collector:
         self.events.append((time.time(), level, msg))
 
     # ---- step 3: validation + enrichment of one row ----
-    def validate(self, r, now):
+    def validate(self, r, now, source):
         lat, lon = to_float(r.get("position.latitude")), to_float(r.get("position.longitude"))
         if lat is None or lon is None:
             return "no_position", None
@@ -228,15 +324,21 @@ class Collector:
                 if speed > JUMP_KMH and moved > 100:
                     flag = "gps_jump"
         trip, route = r.get("trip.trip_id"), r.get("trip.route_id")
-        row = [int(now), int(ts), vid, route or "", trip or "", r.get("trip.start_date", ""), r.get("trip.start_time", ""),
-               round(lat, 6), round(lon, 6), int(age), "" if dt is None else int(dt),
-               "" if moved is None else round(moved, 1), "" if speed is None else round(speed, 1), flag,
+        sp = to_float(r.get("position.speed")) if source == "tstack" else None      # OTD always sends 0: not a real speed
+        extra = {k: v for k, v in r.items() if k not in KNOWN and not (k == "vehicle.label" and str(v) == vid)}
+        row = [int(now), source, int(ts), vid, route or "", trip or "", r.get("trip.start_date", ""), r.get("trip.start_time", ""),
+               r.get("trip.schedule_relationship", ""), round(lat, 6), round(lon, 6), "" if sp is None else round(sp, 2), int(age),
+               "" if dt is None else int(dt), "" if moved is None else round(moved, 1), "" if speed is None else round(speed, 1), flag,
                "" if not self.static else int(str(trip) in self.static["trips"]),
                "" if not self.static else int(str(route) in self.static["routes"]),
-               r.get("position.bearing", ""), r.get("stop_id", ""), r.get("current_stop_sequence", ""),
-               r.get("occupancy_status", "")]
+               json.dumps(extra, separators=(",", ":")) if extra else ""]
         self.last_seen[vid] = (ts, lat, lon)
         return flag or "ok", row
+
+    def note_switch(self, health):
+        if self.feeds.just_switched:
+            health["event"] = self.feeds.note
+            self.log(self.feeds.note, "warn")
 
     # ---- one full poll ----
     def cycle(self):
@@ -245,48 +347,67 @@ class Collector:
         self.stats["polls"] += 1
         health = dict.fromkeys(HEALTH_COLUMNS, "")
         health["fetched_at"] = int(now)
-        rep = {"time": now, "stages": stages, "ok": False, "kept": 0, "skipped": Counter(), "flagged": 0, "total": 0}
+        rep = {"time": now, "stages": stages, "ok": False, "kept": 0, "skipped": Counter(), "flagged": 0, "total": 0, "source": ""}
         try:                                                                             # 1 FETCH + 2 DECODE
-            f = self.source.fetch()
+            f = self.feeds.fetch()
         except Exception as e:
+            src = self.feeds.trying
+            rep["source"] = health["source"] = src
             msg = redact(f"{type(e).__name__}: {e}")[:160]
-            stages.append(("FETCH", "FAIL", msg))
+            stages.append(("FETCH", "FAIL", f"{LABEL[src]}: {msg}"))
             self.stats["failed"] += 1
             health["error"] = msg
-            self.log(f"Download failed: {msg}. Will retry.", "err")
+            self.log(f"{LABEL[src]} download failed: {msg}", "err")
+            self.feeds.mark(False)
+            self.note_switch(health)
             self.write_health(health)
             return self.finish(rep, False)
+        src = f["source"]
+        rep["source"] = health["source"] = src
+        self.polls_by_source[src] += 1
         raw_note = ""
         if self.save_raw and f.get("raw"):
             try:                                   # keep the untouched file so cleaning rules can be re-run later
                 rd = self.dir / "raw" / ist_date(now)
                 rd.mkdir(parents=True, exist_ok=True)
-                with gzip.open(rd / f"{ist_clock(now).replace(':', '')}_{int(now * 100) % 100:02d}.pb.gz", "wb") as fh:
+                with gzip.open(rd / f"{ist_clock(now).replace(':', '')}_{int(now * 100) % 100:02d}_{src}.pb.gz", "wb") as fh:
                     fh.write(f["raw"])
                 raw_note = "  (raw copy saved)"
             except Exception as e:
                 raw_note = f"  (raw save failed: {e})"
-        stages.append(("FETCH", "ok", f"HTTP {f['status']}  {f['bytes'] / 1e6:.2f} MB  {f['latency']:.2f} s{raw_note}"))
+        tag = LABEL[src] + (" (fallback)" if src != self.feeds.primary else "")
+        stages.append(("FETCH", "ok", f"{tag}: HTTP {f['status']}  {f['bytes'] / 1e6:.2f} MB  {f['latency']:.2f} s{raw_note}"))
         rows = f["rows"]
         n = len(rows)
         health.update(http_status=f["status"], latency_s=round(f["latency"], 2), bytes=f["bytes"], vehicles_in_feed=n)
         if f.get("header_ts"):
             health["feed_age_s"] = int(now - f["header_ts"])
-        typical = sorted(self.counts)[len(self.counts) // 2] if self.counts else 0
+        cnt = self.counts[src]
+        typical = sorted(cnt)[len(cnt) // 2] if cnt else 0
         if n == 0 or (typical >= 200 and n < 0.2 * typical):
             stages.append(("DECODE", "WARN", f"only {n} vehicles in the file (usually about {typical}). Skipping this poll."))
             self.stats["empty"] += 1
             health["error"] = "empty_or_short_snapshot"
-            self.log(f"Feed returned only {n} vehicles (usually ~{typical}). Ignored it, nothing was deleted.", "warn")
+            self.log(f"{LABEL[src]} returned only {n} vehicles (usually ~{typical}). Ignored it, nothing was deleted.", "warn")
+            self.feeds.mark(False)
+            self.note_switch(health)
             self.write_health(health)
             self.finish(rep, False)
             return "empty"                     # the server often fixes itself in seconds: retry soon, no back-off
-        self.counts.append(n)
-        age_txt = f", feed time {health['feed_age_s']} s old" if health["feed_age_s"] != "" else ""
-        stages.append(("DECODE", "ok", f"{n} vehicles in the file{age_txt}"))
+        cnt.append(n)
+        age_txt = f", file made {health['feed_age_s']} s ago" if health["feed_age_s"] != "" else ""
+        if src == "tstack":
+            sp = [to_float(r.get("position.speed")) for r in rows]
+            have = [x for x in sp if x is not None]
+            health["speed_present_pct"] = round(100 * len(have) / n)
+            health["speed_zero_pct"] = round(100 * sum(1 for x in have if x == 0) / len(have)) if have else ""
+            sp_txt = f", reported speed on {health['speed_present_pct']}% (zero on {health['speed_zero_pct']}% of those)"
+        else:
+            sp_txt = ", no real speed in this feed"
+        stages.append(("DECODE", "ok", f"{n} vehicles{age_txt}{sp_txt}"))
         kept, skipped, flagged = [], Counter(), 0                                       # 3 VALIDATE
         for r in rows:
-            res, row = self.validate(r, now)
+            res, row = self.validate(r, now, src)
             if row is None:
                 skipped[res] += 1
             else:
@@ -309,6 +430,7 @@ class Collector:
             size = path.stat().st_size
             stages.append(("SAVE", "ok", f"+{len(kept)} rows -> {path}  ({size / 1e6:.1f} MB today)"))
             self.stats["saved"] += len(kept)
+            self.rows_by_source[src] += len(kept)
             self.stats["cycles_bytes"] += 1
             self.stats["bytes"] = sum(p.stat().st_size for p in (self.dir / "clean").glob("*.csv.gz"))
         except Exception as e:
@@ -316,15 +438,16 @@ class Collector:
             health["error"] = "save_failed"
             self.log(f"Could not write file: {e}", "err")
         for r in kept:
-            self.vehicles.add(r[2])
-        health.update(rows_saved=len(kept), duplicate=skipped["duplicate"], stale=skipped["stale"],
-                      outside_area=skipped["outside_area"],
+            self.vehicles.add(r[3])
+        health.update(rows_saved=len(kept), duplicate=skipped["duplicate"], stale=skipped["stale"], outside_area=skipped["outside_area"],
                       bad_row=skipped["no_position"] + skipped["no_time"] + skipped["future_time"], flag_gps_jump=flagged)
+        self.feeds.mark(True)
+        self.note_switch(health)
         self.write_health(health)                                                       # 5 HEALTH
         stages.append(("HEALTH", "ok", "poll recorded in data/health/"))
         rep.update(kept=len(kept), skipped=skipped, flagged=flagged, total=n)
         self.stats["ok"] += 1
-        self.log(f"Poll saved {len(kept)} new pings out of {n} vehicles.", "info")
+        self.log(f"{LABEL[src]}: saved {len(kept)} new pings out of {n} vehicles.", "info")
         return self.finish(rep, True)
 
     def write_health(self, h):
@@ -361,7 +484,10 @@ class Collector:
                     delay = min(5, self.interval)
                 else:
                     fails += 1
-                    delay = min(self.interval * 2 ** min(fails, 3), 120)
+                    delay = 5 if len(self.feeds.sources) > 1 else min(self.interval * 2 ** min(fails, 3), 120)
+                if self.feeds.just_switched:
+                    self.feeds.just_switched = False
+                    delay = 1                  # try the other feed right away
             else:
                 delay = 1
             self.next_at = time.time() + delay
@@ -372,7 +498,7 @@ class Collector:
 # ============================ PLAIN (TEXT) FRONT-END ============================
 def plain_report(c):
     def cb(rep):
-        print(f"\n[{ist_clock(rep['time'])}] Poll #{c.stats['polls']}")
+        print(f"\n[{ist_clock(rep['time'])}] Poll #{c.stats['polls']}   feed: {c.feeds.state_text()}")
         for name, st, detail in rep["stages"]:
             print(f"  {name:<9}{st:<5} {detail}")
         if rep["stages"] and rep["stages"][-1][0] == "HEALTH":
@@ -456,8 +582,10 @@ class Dashboard:
         H, W = scr.size()
         now = time.time()
         state = "PAUSED" if c.paused else f"next poll in {max(0, c.next_at - now):.0f}s"
-        scr.put(0, 0, f" OTD Live Collector | poll every {c.interval}s | {state} | running {int((now - c.t_start) // 60)} min | folder {c.dir}".ljust(W), "hdr")
-        r = 2
+        scr.put(0, 0, f" OTD Live Collector v2 | poll every {c.interval}s | {state} | running {int((now - c.t_start) // 60)} min | folder {c.dir}".ljust(W), "hdr")
+        fb = c.feeds.active != c.feeds.primary
+        scr.put(1, 1, f"FEED NOW: {c.feeds.state_text()}", "warn" if fb else "ok")
+        r = 3
         scr.put(r, 1, "WHAT HAPPENED IN THE LAST POLL", "bold"); r += 1
         rep = c.report
         if not rep:
@@ -478,6 +606,7 @@ class Dashboard:
         s = c.stats
         scr.put(r, 1, "TOTALS SINCE START", "bold"); r += 1
         scr.put(r, 3, f"polls {s['polls']}  (ok {s['ok']}, failed {s['failed']}, empty feed {s['empty']})   rows saved {s['saved']:,}   different buses seen {len(c.vehicles):,}"); r += 1
+        scr.put(r, 3, "polls / rows by feed:  " + "   ".join(f"{LABEL[k]} {c.polls_by_source[k]} polls, {c.rows_by_source[k]:,} rows" for k in ("tstack", "otd"))); r += 1
         est = c.per_day_estimate()
         scr.put(r, 3, f"data on disk {s['bytes'] / 1e6:.1f} MB" + (f"   estimate at this rate: about {est / 1e9:.2f} GB per day" if est else "")); r += 2
         scr.put(r, 1, "WHY ROWS WERE SKIPPED (all polls so far)", "bold"); r += 1
@@ -520,44 +649,74 @@ def run_dashboard(c):
 
 # ============================ INSPECT ============================
 def inspect(data_dir):
+    import numpy as np
     import pandas as pd
     d = Path(data_dir)
     files = sorted((d / "clean").glob("*.csv.gz"))
     if not files:
         print(f"No data in {d}/clean/ yet. Run:  python otd_collector.py run"); return
     print("=== COLLECTED DATA (times in IST) ===")
+    str_cols = {c: str for c in ("vehicle_id", "route_id", "trip_id", "flag", "schedule", "source", "start_date", "start_time", "extra")}
     for f in files:
-        df = pd.read_csv(f, dtype={"vehicle_id": str, "route_id": str, "trip_id": str, "flag": str, "bearing": str, "stop_id": str, "occupancy": str}, low_memory=False)
+        if not header_ok(f, COLUMNS):
+            print(f"\n{f.name}: older file layout, skipped (rename the old data folder)"); continue
+        df = pd.read_csv(f, dtype=str_cols, low_memory=False)
         hrs = ((df["ts"] + IST) // 3600 % 24).astype(int).value_counts().sort_index()
         print(f"\n{f.name}: {len(df):,} rows | {df['vehicle_id'].nunique():,} buses | {df['route_id'].nunique():,} routes | {f.stat().st_size / 1e6:.1f} MB")
-        dt = df["dt_s"].dropna()
+        print("  rows by feed: " + ", ".join(f"{LABEL.get(k, k)} {v:,}" for k, v in df["source"].value_counts().items()))
+        dt = pd.to_numeric(df["dt_s"], errors="coerce").dropna()
         if len(dt):
-            print(f"  time between saved pings of one bus: median {dt.median():.0f} s, 90th percentile {dt.quantile(.9):.0f} s  <- tells how fine your ETA data can be")
-        sp = df["speed_kmh"].dropna()
+            print(f"  time between saved pings of one bus: median {dt.median():.0f} s, 90th percentile {dt.quantile(.9):.0f} s  <- limited by your poll interval; run with --interval 10 to see the buses' real rhythm")
+        ts_rows = df[df["source"] == "tstack"]
+        sp = pd.to_numeric(ts_rows["speed_ms"], errors="coerce").dropna()
+        if len(ts_rows):
+            print(f"  REPORTED speed (Transport Stack rows): present on {100 * len(sp) / len(ts_rows):.0f}% of rows, zero on {100 * (sp == 0).mean() if len(sp) else 0:.0f}% of those"
+                  + (f", moving buses: median {sp[sp > 0].median() * 3.6:.1f} km/h, 90th percentile {sp[sp > 0].quantile(.9) * 3.6:.1f} km/h" if (sp > 0).any() else ""))
+        calc = pd.to_numeric(df["speed_calc_kmh"], errors="coerce").dropna()
+        if len(calc):
+            print(f"  CALCULATED speed (from positions): median {calc.median():.1f} km/h, share moving (>2 km/h) {100 * (calc > 2).mean():.0f}%")
         if len(sp):
-            print(f"  speed derived from positions: median {sp.median():.1f} km/h, share of moving pings (>2 km/h) {100 * (sp > 2).mean():.0f}%")
-        def pct(col):
-            v = pd.to_numeric(df[col], errors="coerce").mean()
-            return "n/a (no GTFS was loaded)" if pd.isna(v) else f"{100 * v:.0f}%"
-        print(f"  flagged gps_jump: {(df['flag'] == 'gps_jump').sum():,}   trip_id found in static: {pct('trip_in_static')}   route_id found: {pct('route_in_static')}")
+            t = ts_rows.assign(rep=pd.to_numeric(ts_rows["speed_ms"], errors="coerce") * 3.6, calc=pd.to_numeric(ts_rows["speed_calc_kmh"], errors="coerce"),
+                               dts=pd.to_numeric(ts_rows["dt_s"], errors="coerce"))
+            t = t[(t["dts"] >= 10) & (t["dts"] <= 60) & (t["rep"] > 5) & (t["calc"] > 5)]
+            if len(t) >= 100:
+                ratio, corr = (t["calc"] / t["rep"]).median(), np.corrcoef(t["calc"], t["rep"])[0, 1]
+                verdict = "consistent: the reported speed looks like metres per second" if 0.8 <= ratio <= 1.25 else (
+                    "calculated is about 0.28x the reported number: the reported speed may already be km/h, not m/s" if 0.2 <= ratio <= 0.35 else "does not match well, investigate")
+                print(f"  UNIT CHECK on {len(t):,} moving pings: calculated / reported (as m/s) = {ratio:.2f} (median), correlation {corr:.2f}  -> {verdict}")
+        sched = df.groupby(df["schedule"].fillna("(none)")).agg(rows=("ts", "size"), trip_in_static=("trip_in_static", lambda s: pd.to_numeric(s, errors="coerce").mean()))
+        print("  schedule_relationship: " + ", ".join(f"{k} {int(v.rows):,} rows (trip_id found in static: {'n/a' if pd.isna(v.trip_in_static) else f'{100 * v.trip_in_static:.0f}%'})" for k, v in sched.iterrows()))
+        ex = df["extra"].dropna()
+        if len(ex):
+            print(f"  EXTRA fields the feed sent that we did not expect: {len(ex):,} rows, e.g. {ex.iloc[0][:100]}")
+        rin = pd.to_numeric(df["route_in_static"], errors="coerce").mean()
+        print(f"  flagged gps_jump: {(df['flag'] == 'gps_jump').sum():,}   route_id found in static: {'n/a (no GTFS was loaded)' if pd.isna(rin) else f'{100 * rin:.0f}%'}")
         print("  rows per hour:  " + " ".join(f"{h:02d}h:{n:,}" for h, n in hrs.items()))
         print("  busiest routes: " + ", ".join(f"{r} ({n:,})" for r, n in df["route_id"].value_counts().head(8).items()))
-    hf = sorted((d / "health").glob("*.csv"))
+    hf = [f for f in sorted((d / "health").glob("*.csv")) if header_ok(f, HEALTH_COLUMNS)]
     if hf:
-        h = pd.concat([pd.read_csv(f) for f in hf])
-        ok = h["error"].isna()
-        print(f"\n=== FEED HEALTH ===\npolls {len(h):,} | clean {100 * ok.mean():.1f}% | problems: {h['error'].value_counts().to_dict() or 'none'}")
-        print(f"median download time {h['latency_s'].median():.2f} s | median vehicles in feed {h['vehicles_in_feed'].median():,.0f}")
+        h = pd.concat([pd.read_csv(f, dtype={"event": str, "error": str}) for f in hf])
+        print("\n=== FEED HEALTH ===")
+        for src, g in h.groupby("source"):
+            ok = g["error"].isna()
+            probs = g["error"].dropna().map(lambda x: x[:60]).value_counts().to_dict()
+            print(f"{LABEL.get(src, src)}: {len(g):,} polls, clean {100 * ok.mean():.1f}%, median download {g['latency_s'].median():.2f} s, median vehicles {g['vehicles_in_feed'].median():,.0f}, "
+                  f"median file age {pd.to_numeric(g['feed_age_s'], errors='coerce').median():.0f} s")
+            print(f"    problems: {probs or 'none'}")
+        ev = h["event"].dropna()
+        print(f"feed switches: {len(ev)}" + (": " + "; ".join(ev.head(5)) if len(ev) else ""))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OTD live collector")
+    ap = argparse.ArgumentParser(description="OTD live collector v2")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--plain", action="store_true", help="print readable text instead of the dashboard")
-    r.add_argument("--demo", action="store_true", help="fake feed (no key needed), saves into data_demo/")
-    r.add_argument("--save-raw", action="store_true", help="also keep every downloaded file in data/raw/ (about 100-200 MB per 5 h)")
+    r.add_argument("--demo", action="store_true", help="fake feeds (no keys needed), saves into data_demo/")
     r.add_argument("--once", action="store_true", help="do one poll and stop (implies --plain)")
+    r.add_argument("--save-raw", action="store_true", help="also keep every downloaded file in data/raw/ (about 100-200 MB per 5 h)")
+    r.add_argument("--using-otd", action="store_true", help="OTD Delhi as the main feed (Transport Stack becomes the fallback)")
+    r.add_argument("--no-fallback", action="store_true", help="never switch to the other feed")
     r.add_argument("--interval", type=int, default=INTERVAL)
     r.add_argument("--data", default=None)
     r.add_argument("--gtfs", default=GTFS_DIR)
@@ -565,13 +724,27 @@ def main():
     a = ap.parse_args()
     if a.cmd == "inspect":
         return inspect(a.data)
+    primary = "otd" if a.using_otd else "tstack"
+    other = "tstack" if a.using_otd else "otd"
     if a.demo:
-        source, data = FakeSource(), a.data or "data_demo"
+        buses = demo_buses()
+        sources = {"tstack": FakeSource("tstack", buses), "otd": FakeSource("otd", buses)}
+        if a.no_fallback:
+            sources = {primary: sources[primary]}
+        data = a.data or "data_demo"
     else:
-        key = os.getenv("OTD_API_KEY") or API_KEY
-        if key == "PASTE_YOUR_API_KEY_HERE":
-            raise SystemExit("Paste your key into API_KEY at the top of otd_collector.py (or set OTD_API_KEY).")
-        source, data = LiveSource(key), a.data or DATA_DIR
+        keys = {"otd": OTD_API_KEY, "tstack": TSTACK_API_KEY}
+        if not key_ok(keys[primary]):
+            raise SystemExit(f"Paste your {LABEL[primary]} API key into {'OTD_API_KEY' if primary == 'otd' else 'TSTACK_API_KEY'} at the top of otd_collector.py."
+                             + ("" if a.using_otd else "  (To use OTD as the main feed instead, run with --using-otd.)"))
+        sources = {primary: LiveSource(primary, keys[primary])}
+        if not a.no_fallback:
+            if key_ok(keys[other]):
+                sources[other] = LiveSource(other, keys[other])
+            else:
+                print(f"Note: no {LABEL[other]} key pasted, so there is no fallback feed.")
+        data = a.data or DATA_DIR
+    check_formats(data)
     static = None
     try:
         static = load_static(a.gtfs)
@@ -579,7 +752,7 @@ def main():
         print(f"(could not read GTFS from {a.gtfs}: {e})")
     if static is None:
         print(f"Note: no GTFS in '{a.gtfs}/' -> trip/route match columns will stay empty.")
-    c = Collector(source, static, data, max(MIN_INTERVAL, a.interval), save_raw=a.save_raw)
+    c = Collector(FeedManager(primary, sources), static, data, max(MIN_INTERVAL, a.interval), save_raw=a.save_raw)
     if a.plain or a.once or not sys.stdout.isatty():
         run_plain(c, a.once)
     else:

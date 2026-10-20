@@ -25,13 +25,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ========================= CONFIG (edit these) =========================
-API_KEY = os.getenv("API_KEY")     # <-- paste your OTD key here (or set env var OTD_API_KEY)
+TRANSPORT_STACK_API_KEY = os.getenv("TRANSPORT_STACK_API_KEY")   # <-- paste your Delhi Transport Stack key (default feed)
+OTD_API_KEY = os.getenv("OTD_API_KEY")                    # <-- paste your OTD Delhi key (--using-otd, and as the fallback feed)
 GTFS_DIR = "gtfs"                        # folder with routes.txt, trips.txt, stops.txt, stop_times.txt
-BASE_URL = "https://otd.delhi.gov.in"
-RT_PATH = "/api/realtime/VehiclePositions.pb"
+TSTACK_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"      # key goes in the x-api-key header
+TSTACK_PARAMS = {"agency": "delhi-buses", "category": "realtime_gtfs", "filename": "VehiclePositions.pb"}
+OTD_URL = "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb"             # key goes in the URL (?key=...)
 REFRESH_SECONDS = 15                     # feed updates about every 10 s; do not go lower than 10
 START_LAT, START_LON = 28.6315, 77.2167  # Connaught Place
 # =======================================================================
+
+SECRETS = []               # api keys that must never be shown on screen
+
+
+def redact(text):
+    for k in SECRETS:
+        if k and len(k) > 4:
+            text = str(text).replace(k, "***")
+    return str(text)
+
+
+LABEL = {"otd": "OTD", "tstack": "Transport Stack"}
+
+
+def key_ok(k):
+    return bool(k) and not str(k).startswith("PASTE")
+
 
 ZOOMS = [10, 25, 50, 100, 200, 400, 800, 1600, 3200, 6400]   # metres per terminal column
 DEFAULT_ZOOM = 3
@@ -229,8 +248,9 @@ class Fleet:
     def age(self, b):
         return max(0.0, time.time() - b.ts)
 
-    def __init__(self, static):
+    def __init__(self, static, source_name="tstack", source_label="Transport Stack", eta_speed="reported"):
         self.static = static
+        self.source_name, self.source_label, self.eta_speed = source_name, source_label, eta_speed
         self.buses, self.by_route, self.rows = {}, {}, []
         self.snap, self.last_ok, self.last_err, self.header_ts = 0, None, None, None
         self.bad_snaps = 0                 # empty / suspiciously short feed answers that were ignored
@@ -300,16 +320,36 @@ class Fleet:
         b.assign = Assign(best[3], best[1], best[0], conf, best[2], alts)
         return b.assign
 
-    def speed(self, b):
-        """(metres/second, source). Derived from positions first, because the feed speed may be 0."""
+    @staticmethod
+    def _kmh(x):
+        return None if x is None else x * 3.6
+
+    def speed_calc(self, b):
+        """Speed worked out from the bus's own recent positions, in m/s (None if no ping 20-180 s old). Not clipped."""
         t1, la1, lo1 = b.hist[-1]
         for t0, la0, lo0 in b.hist:
             dt = t1 - t0
             if 20 <= dt <= 180:
-                return min(max(hav(la0, lo0, la1, lo1) / dt, 2.0), 14.0), "derived"
-        s = to_float(b.row.get("position.speed"))
-        if s and s > 0.5:
-            return min(s, 14.0), "feed"
+                return hav(la0, lo0, la1, lo1) / dt
+        return None
+
+    def speed_real(self, b):
+        """Speed reported by the feed in m/s (None if missing). OTD always sends 0, so it is ignored there."""
+        if self.source_name == "otd":
+            return None
+        return to_float(b.row.get("position.speed"))
+
+    def speed(self, b):
+        """(m/s used for the ETA, source). Default (--eta-speed reported): the speed reported by the feed, and the
+        calculated speed when the feed has none. With --eta-speed calculated: the other way round.
+        Always clipped to 2-14 m/s so a bus standing at a red light does not give an endless ETA."""
+        calc, real = self.speed_calc(b), self.speed_real(b)
+        order = ("calc", "real") if self.eta_speed == "calculated" else ("real", "calc")
+        for i, name in enumerate(order):
+            if name == "real" and real is not None and (i == 0 or real > 0.5):
+                return min(max(real, 2.0), 14.0), "real"
+            if name == "calc" and calc is not None:
+                return min(max(calc, 2.0), 14.0), "calc"
         return ASSUMED_SPEED, "assumed"
 
     def stop_board(self, stop_id):
@@ -329,25 +369,40 @@ class Fleet:
                 between = int(np.searchsorted(pat.cum, target) - np.searchsorted(pat.cum, prog))
                 eta = max(0.0, rem / v + DWELL_S * max(0, between - 1) - self.age(b))   # bus moved since its last ping
                 rows.append({"bus": b, "route": self.static.label(pat.route_id), "to": pat.headsign,
-                             "eta_s": eta, "dist": rem, "speed": v * 3.6, "src": src, "conf": "dir?" if a.conf == "guess" else a.conf})
+                             "eta_s": eta, "dist": rem, "speed": v * 3.6, "src": src, "real": self._kmh(self.speed_real(b)), "calc": self._kmh(self.speed_calc(b)), "conf": "dir?" if a.conf == "guess" else a.conf})
         rows.sort(key=lambda r: r["eta_s"])
         return rows
 
 
 # ============================ DATA SOURCES ============================
 class LiveSource:
-    def __init__(self, key):
-        self.key = key
+    """source = "tstack" (Delhi Transport Stack, key in the x-api-key header) or "otd" (OTD Delhi, key in the URL)."""
+    def __init__(self, source, key):
+        self.source, self.key = source, key
+        SECRETS.append(key)
+
+    def http_get(self):
+        if self.source == "otd":
+            r = requests.get(OTD_URL, params={"key": self.key}, timeout=20)
+            who = "OTD (OTD_API_KEY)"
+        else:
+            r = requests.get(TSTACK_URL, params=TSTACK_PARAMS, headers={"x-api-key": self.key}, timeout=20)
+            who = "Transport Stack (TRANSPORT_STACK_API_KEY)"
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"HTTP {r.status_code}: the {who} key was rejected. Check the key at the top of delhi_bus_tui.py.")
+        if r.status_code == 429:
+            raise RuntimeError("HTTP 429: too many requests. Increase --refresh.")
+        r.raise_for_status()
+        if r.content[:1] in (b"{", b"<", b"["):
+            raise RuntimeError("the server sent text instead of a feed: " + redact(r.content[:100].decode("utf-8", "replace")))
+        return r.content
 
     def fetch(self):
         from google.transit import gtfs_realtime_pb2
         from google.protobuf.json_format import MessageToDict
-        r = requests.get(BASE_URL + RT_PATH, params={"key": self.key}, timeout=20)
-        if r.status_code in (401, 403):
-            raise RuntimeError(f"HTTP {r.status_code}: API key rejected. Check API_KEY in the script.")
-        r.raise_for_status()
+        content = self.http_get()
         feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(r.content)
+        feed.ParseFromString(content)
         rows = []
         for e in feed.entity:
             if e.HasField("vehicle"):
@@ -355,6 +410,47 @@ class LiveSource:
                 row["entity_id"] = e.id
                 rows.append(row)
         return rows, (feed.header.timestamp if feed.header.HasField("timestamp") else None)
+
+
+class FeedManager:
+    """Calls ONE feed per refresh. The other feed is only a fallback:
+    - 2 problems in a row (error, rejected key, empty or tiny file) on the active feed -> switch to the other feed
+    - while on the fallback, every 4th refresh the main feed is tried once; if it works the app switches back."""
+    def __init__(self, primary, keys, fleet, use_fallback=True):
+        other = "tstack" if primary == "otd" else "otd"
+        self.primary, self.other, self.fleet = primary, other, fleet
+        self.sources = {primary: LiveSource(primary, keys[primary])}
+        if use_fallback:
+            self.sources[other] = LiveSource(other, keys[other])
+        self.active, self.trying, self.fails, self.fb_cycles = primary, primary, 0, 0
+        self.just_switched, self.note = False, ""
+
+    def fetch(self):
+        name = self.active
+        if self.active != self.primary:
+            self.fb_cycles += 1
+            if self.fb_cycles % 4 == 0:
+                name = self.primary                    # a quick check whether the main feed works again
+        self.trying = name
+        rows, hts = self.sources[name].fetch()         # problems are raised as errors
+        self.fleet.source_name = name
+        self.fleet.source_label = LABEL[name] + (" (fallback)" if name != self.primary else "")
+        return rows, hts
+
+    def mark(self, ok):
+        name = self.trying
+        if ok:
+            if name == self.primary and self.active != self.primary:
+                self.active, self.just_switched, self.note = self.primary, True, f"{LABEL[self.primary]} works again, switched back."
+            self.fails = 0
+            return
+        if name != self.active:                        # a failed check of the main feed: stay on the fallback
+            return
+        self.fails += 1
+        if self.fails >= 2 and len(self.sources) > 1:
+            old, self.active = self.active, (self.other if self.active == self.primary else self.primary)
+            self.fails, self.fb_cycles, self.just_switched = 0, 0, True
+            self.note = f"{LABEL[old]} had problems, now using {LABEL[self.active]}."
 
 
 def flatten(d, prefix=""):
@@ -387,8 +483,8 @@ def demo_static():
 
 
 class DemoSource:
-    def __init__(self, static):
-        self.static, self.state, self.t = static, [], time.time()
+    def __init__(self, static, with_speed=True):
+        self.static, self.state, self.t, self.with_speed = static, [], time.time(), with_speed
         random.seed(3)
         i = 0
         for rid, pats in static.patterns.items():
@@ -409,7 +505,7 @@ class DemoSource:
             lat = p.lat[k] + (p.lat[k + 1] - p.lat[k]) * t + random.uniform(-1, 1) * 1e-4
             lon = p.lon[k] + (p.lon[k + 1] - p.lon[k]) * t + random.uniform(-1, 1) * 1e-4
             row = {"entity_id": s["id"], "vehicle.id": s["id"], "position.latitude": lat, "position.longitude": lon,
-                   "position.speed": 0.0, "timestamp": str(int(now - random.randint(0, 20))),
+                   "position.speed": (s["v"] * random.uniform(0.8, 1.2) if self.with_speed else 0.0), "timestamp": str(int(now - random.randint(0, 20))),
                    "trip.route_id": p.route_id}
             if s["trip"]:
                 row["trip.trip_id"] = f"T{p.route_id[1:]}_{p.direction}_{s['j'] % 4}"
@@ -735,7 +831,7 @@ class App:
     def header(self, scr, W, extra=""):
         f = self.fleet
         age = "-" if not f.last_ok else f"{time.time() - f.last_ok:.0f}s"
-        txt = f" Delhi Live Bus Explorer | buses {len(f.buses)} | updated {age} ago | zoom {ZOOMS[self.z]} m/col"
+        txt = f" Delhi Live Bus Explorer [{f.source_label}] | buses {len(f.buses)} | updated {age} ago | zoom {ZOOMS[self.z]} m/col"
         if f.bad_snaps: txt += f" | empty feeds ignored: {f.bad_snaps}"
         if self.route: txt += f" | route {self.static.label(self.route)}"
         txt += extra
@@ -808,6 +904,15 @@ class App:
         self.draw_panel(scr, H, W, mh, vis)
         self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | r route | x clear | i fields | g Google Maps | ? help | q quit")
 
+    def speed_text(self, b):
+        """reported + calculated speed (Transport Stack), or calculated only (OTD)."""
+        calc, real = self.fleet.speed_calc(b), self.fleet.speed_real(b)
+        c = "-" if calc is None else f"{calc * 3.6:.0f} km/h"
+        if self.fleet.source_name == "otd":
+            return f"speed (calculated) {c}"
+        r = "-" if real is None else f"{real * 3.6:.0f} km/h"
+        return f"speed: reported {r} | calculated {c}"
+
     def draw_panel(self, scr, H, W, mh, vis):
         top = mh + 1
         scr.put(top, 0, "-" * W, "dim")
@@ -820,8 +925,8 @@ class App:
             head = f"BUS {b.key}   route {rid}" + (f"  ->  {a.pat.headsign}" if a else "")
             scr.put(top + 1, 1, head, "bold")
             scr.link(top + 1, len(head) + 4, "[open in Google Maps]", maps_url(b.lat, b.lon))
-            fs = to_float(b.row.get("position.speed"))
-            scr.put(top + 2, 1, f"pos {b.lat:.5f}, {b.lon:.5f}   speed {v * 3.6:.0f} km/h ({src})   feed speed {fs if fs is not None else '-'}   bearing {fmt0(b.row.get('position.bearing'))}   ping age {self.age(b):.0f}s")
+            brg = f"   bearing {fmt0(b.row.get('position.bearing'))}" if b.row.get("position.bearing") is not None else ""
+            scr.put(top + 2, 1, f"pos {b.lat:.5f}, {b.lon:.5f}   {self.speed_text(b)}   ETA uses {v * 3.6:.0f} km/h ({src}){brg}   ping age {self.age(b):.0f}s")
             if a:
                 k = int(np.searchsorted(a.pat.cum, a.prog - 1)); k = min(k, len(a.pat.names) - 1)
                 warn = "   OFF-ROUTE" if a.perp > OFF_ROUTE_M else ""
@@ -852,14 +957,19 @@ class App:
         scr.put(2, 1, head, "bold")
         scr.link(2, len(head) + 4, "[open in Google Maps]", maps_url(la, lo))
         scr.put(3, 1, f"{len(routes)} routes serve this stop: " + " ".join(routes[:40]), "dim")
-        scr.put(5, 1, f"{'ROUTE':<8}{'TOWARDS':<30}{'ETA':>8}{'DIST':>9}{'SPEED':>8}  {'SPEED SRC':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
+        has_real = self.fleet.source_name != "otd"
+        RW, TW = 14, 38                      # width of the ROUTE and TOWARDS columns (text longer than this is cut)
+        scr.put(5, 1, f"{'ROUTE':<{RW}}{'TOWARDS':<{TW}}{'ETA':>8}{'DIST':>9}" + (f"{'REAL':>7}" if has_real else "") + f"{'CALC':>7}  {'ETA USES':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
+        scr.put(4, 1, "speeds in km/h:  REAL = reported by the feed" + (" | " if has_real else "") + "CALC = worked out from the bus's last positions | ETA USES = which one the ETA used" if has_real else "speeds in km/h:  CALC = worked out from the bus's last positions | ETA USES = how the ETA speed was found", "dim")
         rows = self.fleet.stop_board(sid)
         if not rows:
             scr.put(7, 1, "No tracked bus is approaching this stop right now (or buses cannot be matched to routes).", "warn")
         for i, r in enumerate(rows[: H - 9]):
             eta = r["eta_s"]
             e = "due" if eta < 45 else f"{eta / 60:.0f} min"
-            line = f"{r['route']:<8}{str(r['to'])[:28]:<30}{e:>8}{r['dist']:>8.0f}m{r['speed']:>6.0f}km  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}"
+            f1 = lambda x: "-" if x is None else f"{x:.0f}"
+            line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 8]:<{TW}}{e:>8}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
+                    + f"{f1(r['calc']):>7}  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}")
             scr.put(6 + i, 1, line, "rev" if i == self.board_i else self.style_for(r["route"]))
         scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
         self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
@@ -885,9 +995,11 @@ class App:
         a = self.fleet.assignment(b); v, src = self.fleet.speed(b)
         scr.put(1, 1, f"position {b.lat:.5f}, {b.lon:.5f}", "bold")
         scr.link(1, 32, "[open in Google Maps]", maps_url(b.lat, b.lon))
-        lines = [("-- raw fields from the OTD feed --", "bold")] + [(f"{k:<32} {val}", "n") for k, val in sorted(b.row.items())]
+        lines = [(f"-- raw fields from the {self.fleet.source_label} feed --", "bold")] + [(f"{k:<32} {val}", "n") for k, val in sorted(b.row.items())]
         lines += [("", "n"), ("-- derived by this app --", "bold"),
                   (f"{'route (resolved)':<32} {self.static.label(b.route_id) if b.route_id else 'NOT RESOLVED'}", "n"),
+                  (f"{'speed reported by the feed':<32} " + ("not used (OTD always sends 0)" if self.fleet.source_name == "otd" else ("-" if self.fleet.speed_real(b) is None else f"{self.fleet.speed_real(b) * 3.6:.1f} km/h ({self.fleet.speed_real(b):.2f} m/s)")), "n"),
+                  (f"{'speed calculated from positions':<32} " + ("- (needs an older ping 20-180 s back)" if self.fleet.speed_calc(b) is None else f"{self.fleet.speed_calc(b) * 3.6:.1f} km/h"), "n"),
                   (f"{'speed used for ETA':<32} {v * 3.6:.1f} km/h ({src})", "n"),
                   (f"{'ping age':<32} {self.age(b):.0f} s", "n"),
                   (f"{'positions remembered':<32} {len(b.hist)}", "n")]
@@ -946,13 +1058,18 @@ class App:
                "         [534] highlighted = selected bus.   + in the middle = map centre.   . = bus stop (zoom in to see)", "",
                "STOP BOARD  upcoming buses sorted by ETA. ETA = distance along the route / speed. Direction 'by' tells how the app",
                "  decided the bus direction: trip (trip_id matched), bearing, history (it moved that way), nearest, guess.", "",
-               "Dim bubbles = no ping for more than 5 minutes."]
+               "Dim bubbles = no ping for more than 5 minutes.", "",
+               "SPEED  REAL = speed reported by the feed (Delhi Transport Stack only; OTD always sends 0).  CALC = distance between the bus's recent positions / time (a 20-180 s average).",
+               "       The ETA uses REAL by default (CALC when the feed has no speed), clipped to 7-50 km/h. Use --eta-speed calculated to use CALC instead.",
+               "FEED   default = Delhi Transport Stack.  --using-otd = OTD as the main feed (calculated speed only).  Only ONE feed is called per refresh; the other one is a fallback",
+               "       after 2 problems in a row (--no-fallback turns this off). Transport Stack pings are about 10 s older than OTD."]
         for i, t in enumerate(txt):
             scr.put(2 + i, 1, t)
         self.footer(scr, H, "any key: back")
 
 
 def fetch_loop(source, fleet, app, interval):
+    mark = getattr(source, "mark", lambda ok: None)
     while not app.quit:
         try:
             rows, hts = source.fetch()
@@ -963,11 +1080,18 @@ def fetch_loop(source, fleet, app, interval):
                 fleet.bad_snaps += 1
                 fleet.last_ok = fleet.last_ok or time.time()
                 app.msg = f"Feed sent only {len(rows)} vehicles (before: {prev}). Kept the old data."
+                mark(False)
             else:
                 fleet.update(rows, hts)
                 app.msg = ""
+                mark(True)
         except Exception as e:
-            fleet.last_err = f"{type(e).__name__}: {e}"[:200]
+            fleet.last_err = redact(f"{type(e).__name__}: {e}")[:200]
+            mark(False)
+        if getattr(source, "just_switched", False):
+            source.just_switched = False
+            app.msg = source.note
+            app.force.set()                            # try the other feed right away
         app.force.wait(timeout=max(10, interval))
         app.force.clear()
 
@@ -982,18 +1106,32 @@ def run(stdscr, app, source, interval):
 
 def main():
     ap = argparse.ArgumentParser(description="Delhi live bus explorer")
-    ap.add_argument("--demo", action="store_true", help="use fake buses (no key, no GTFS files needed)")
+    ap.add_argument("--demo", action="store_true", help="use fake buses (no keys, no GTFS files needed)")
+    ap.add_argument("--using-otd", action="store_true", help="use the OTD Delhi feed as the main feed instead of Delhi Transport Stack (calculated speed only)")
+    ap.add_argument("--no-fallback", action="store_true", help="never switch to the other feed, even if the main feed has problems")
+    ap.add_argument("--eta-speed", choices=["reported", "calculated"], default="reported", help="which speed the ETA uses (default: reported, calculated when the feed has none)")
     ap.add_argument("--gtfs", default=GTFS_DIR)
     ap.add_argument("--refresh", type=int, default=REFRESH_SECONDS)
     a = ap.parse_args()
+    keys = {"otd": OTD_API_KEY, "tstack": TRANSPORT_STACK_API_KEY}
+    name = "otd" if a.using_otd else "tstack"
+    label = LABEL[name] + (" demo" if a.demo else "")
+    fleet = None
     if a.demo:
-        static = demo_static(); source = DemoSource(static)
+        static = demo_static(); source = DemoSource(static, with_speed=not a.using_otd)
+        fleet = Fleet(static, name, label, a.eta_speed)
     else:
-        key = os.getenv("OTD_API_KEY") or API_KEY
-        if key == "PASTE_YOUR_API_KEY_HERE":
-            raise SystemExit("Open delhi_bus_tui.py and paste your key into API_KEY (or set OTD_API_KEY).")
-        static = load_static(a.gtfs); source = LiveSource(key)
-    fleet = Fleet(static)
+        if not key_ok(keys[name]):
+            var = "OTD_API_KEY" if a.using_otd else "TRANSPORT_STACK_API_KEY"
+            raise SystemExit(f"Paste your {LABEL[name]} API key into {var} at the top of delhi_bus_tui.py." + ("" if a.using_otd else "  (To use the OTD feed instead, run with --using-otd.)"))
+        other = "tstack" if a.using_otd else "otd"
+        use_fb = (not a.no_fallback) and key_ok(keys[other])
+        static = load_static(a.gtfs)
+        fleet = Fleet(static, name, label, a.eta_speed)
+        source = FeedManager(name, keys, fleet, use_fb)
+        if not a.no_fallback and not use_fb:
+            print(f"Note: no {LABEL[other]} key pasted, so there is no fallback feed. Starting...")
+            time.sleep(1.5)
     app = App(static, fleet, START_LAT, START_LON)
     curses.wrapper(run, app, source, a.refresh)
 

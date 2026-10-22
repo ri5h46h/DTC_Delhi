@@ -48,7 +48,8 @@ IST = 19800                             # seconds; file dates and hours use Indi
 
 LABEL = {"tstack": "Transport Stack", "otd": "OTD"}
 COLUMNS = ["fetched_at", "source", "ts", "vehicle_id", "route_id", "trip_id", "start_date", "start_time", "schedule",
-           "lat", "lon", "speed_ms", "age_s", "dt_s", "moved_m", "speed_calc_kmh", "flag", "trip_in_static", "route_in_static", "extra"]
+           "lat", "lon", "speed_rep", "age_s", "dt_s", "moved_m", "speed_calc_kmh", "flag", "trip_in_static", "route_in_static", "extra"]
+LEGACY_COLUMNS = [("speed_ms" if c == "speed_rep" else c) for c in COLUMNS]     # layout of the first test version of the collector
 HEALTH_COLUMNS = ["fetched_at", "source", "http_status", "latency_s", "bytes", "vehicles_in_feed", "feed_age_s", "rows_saved",
                   "duplicate", "stale", "outside_area", "bad_row", "flag_gps_jump", "speed_present_pct", "speed_zero_pct", "event", "error"]
 # fields the collector knows. Anything else the feed sends is kept in the 'extra' column (so nothing is lost silently).
@@ -324,7 +325,7 @@ class Collector:
                 if speed > JUMP_KMH and moved > 100:
                     flag = "gps_jump"
         trip, route = r.get("trip.trip_id"), r.get("trip.route_id")
-        sp = to_float(r.get("position.speed")) if source == "tstack" else None      # OTD always sends 0: not a real speed
+        sp = to_float(r.get("position.speed")) if source == "tstack" else None      # raw value of the feed (unit checked by inspect). OTD always sends 0: not a real speed
         extra = {k: v for k, v in r.items() if k not in KNOWN and not (k == "vehicle.label" and str(v) == vid)}
         row = [int(now), source, int(ts), vid, route or "", trip or "", r.get("trip.start_date", ""), r.get("trip.start_time", ""),
                r.get("trip.schedule_relationship", ""), round(lat, 6), round(lon, 6), "" if sp is None else round(sp, 2), int(age),
@@ -658,32 +659,57 @@ def inspect(data_dir):
     print("=== COLLECTED DATA (times in IST) ===")
     str_cols = {c: str for c in ("vehicle_id", "route_id", "trip_id", "flag", "schedule", "source", "start_date", "start_time", "extra")}
     for f in files:
+        legacy = False
         if not header_ok(f, COLUMNS):
-            print(f"\n{f.name}: older file layout, skipped (rename the old data folder)"); continue
+            legacy = header_ok(f, LEGACY_COLUMNS)
+            if not legacy:
+                print(f"\n{f.name}: older file layout, skipped (rename the old data folder)"); continue
         df = pd.read_csv(f, dtype=str_cols, low_memory=False)
+        if legacy:
+            df = df.rename(columns={"speed_ms": "speed_rep"})
         hrs = ((df["ts"] + IST) // 3600 % 24).astype(int).value_counts().sort_index()
         print(f"\n{f.name}: {len(df):,} rows | {df['vehicle_id'].nunique():,} buses | {df['route_id'].nunique():,} routes | {f.stat().st_size / 1e6:.1f} MB")
         print("  rows by feed: " + ", ".join(f"{LABEL.get(k, k)} {v:,}" for k, v in df["source"].value_counts().items()))
         dt = pd.to_numeric(df["dt_s"], errors="coerce").dropna()
         if len(dt):
-            print(f"  time between saved pings of one bus: median {dt.median():.0f} s, 90th percentile {dt.quantile(.9):.0f} s  <- limited by your poll interval; run with --interval 10 to see the buses' real rhythm")
+            print(f"  time between saved pings of one bus: median {dt.median():.0f} s, 90th percentile {dt.quantile(.9):.0f} s"
+                  "  <- if this is about twice your poll interval or more, polling faster brings no new pings")
         ts_rows = df[df["source"] == "tstack"]
-        sp = pd.to_numeric(ts_rows["speed_ms"], errors="coerce").dropna()
+        sp = pd.to_numeric(ts_rows["speed_rep"], errors="coerce").dropna()
         if len(ts_rows):
-            print(f"  REPORTED speed (Transport Stack rows): present on {100 * len(sp) / len(ts_rows):.0f}% of rows, zero on {100 * (sp == 0).mean() if len(sp) else 0:.0f}% of those"
-                  + (f", moving buses: median {sp[sp > 0].median() * 3.6:.1f} km/h, 90th percentile {sp[sp > 0].quantile(.9) * 3.6:.1f} km/h" if (sp > 0).any() else ""))
+            nz = sp[sp > 0]
+            print(f"  REPORTED speed (raw number in the feed's speed field, Transport Stack rows): present on {100 * len(sp) / len(ts_rows):.0f}% of rows, zero on {100 * (sp == 0).mean() if len(sp) else 0:.0f}% of those"
+                  + (f"; non-zero: median {nz.median():.1f}, 90th percentile {nz.quantile(.9):.1f}, max {sp.max():.1f}  (if the unit were m/s: median {nz.median() * 3.6:.0f} km/h, 90th percentile {nz.quantile(.9) * 3.6:.0f} km/h)" if len(nz) else ""))
         calc = pd.to_numeric(df["speed_calc_kmh"], errors="coerce").dropna()
         if len(calc):
-            print(f"  CALCULATED speed (from positions): median {calc.median():.1f} km/h, share moving (>2 km/h) {100 * (calc > 2).mean():.0f}%")
+            print(f"  CALCULATED speed (from positions): median {calc.median():.1f} km/h, share moving (>2 km/h) {100 * (calc > 2).mean():.0f}%, among moving: median {calc[calc > 2].median():.1f}, 90th percentile {calc[calc > 2].quantile(.9):.1f} km/h")
         if len(sp):
-            t = ts_rows.assign(rep=pd.to_numeric(ts_rows["speed_ms"], errors="coerce") * 3.6, calc=pd.to_numeric(ts_rows["speed_calc_kmh"], errors="coerce"),
-                               dts=pd.to_numeric(ts_rows["dt_s"], errors="coerce"))
-            t = t[(t["dts"] >= 10) & (t["dts"] <= 60) & (t["rep"] > 5) & (t["calc"] > 5)]
-            if len(t) >= 100:
-                ratio, corr = (t["calc"] / t["rep"]).median(), np.corrcoef(t["calc"], t["rep"])[0, 1]
-                verdict = "consistent: the reported speed looks like metres per second" if 0.8 <= ratio <= 1.25 else (
-                    "calculated is about 0.28x the reported number: the reported speed may already be km/h, not m/s" if 0.2 <= ratio <= 0.35 else "does not match well, investigate")
-                print(f"  UNIT CHECK on {len(t):,} moving pings: calculated / reported (as m/s) = {ratio:.2f} (median), correlation {corr:.2f}  -> {verdict}")
+            g = df.sort_values(["vehicle_id", "ts"]).copy()
+            g["rep"] = pd.to_numeric(g["speed_rep"], errors="coerce")
+            g["calc_prev"] = pd.to_numeric(g["speed_calc_kmh"], errors="coerce")             # interval that ENDS at this ping
+            same = g["vehicle_id"] == g["vehicle_id"].shift(-1)
+            g["calc_next"] = g["calc_prev"].shift(-1).where(same)                          # interval that STARTS at this ping
+            ok = g[(g["source"] == "tstack") & g["rep"].notna() & pd.to_numeric(g["dt_s"], errors="coerce").between(10, 60)]
+            pp, pn = ok.dropna(subset=["calc_prev"]), ok.dropna(subset=["calc_next"])
+            if len(pp) >= 200 and len(pn) >= 200:
+                r_prev, r_next = pp["rep"].corr(pp["calc_prev"], method="spearman"), pn["rep"].corr(pn["calc_next"], method="spearman")
+                print(f"  SPEED CHECK on {len(pp):,} pings (10-60 s since the previous ping): rank correlation of reported speed with the calculated speed of the interval BEFORE this ping {r_prev:+.2f}, of the interval AFTER it {r_next:+.2f}")
+                bins = [-0.01, 0.5, 2, 5, 8, 12, 16, 20, 1e9]
+                names = ["0", "0.5-2", "2-5", "5-8", "8-12", "12-16", "16-20", "20+"]
+                tb = pp.groupby(pd.cut(pp["rep"], bins, labels=names), observed=True)["calc_prev"].agg(["median", "size"])
+                print("     reported (raw) -> median calculated km/h (pings): " + " | ".join(f"{k}: {v['median']:.0f} ({int(v['size']):,})" for k, v in tb.iterrows()))
+                mv = pp[(pp["rep"] > 1) & (pp["calc_prev"] > 5)]
+                if len(mv) >= 100:
+                    k = (mv["calc_prev"] / mv["rep"]).median()
+                    unit = min({"m/s": 3.6, "km/h": 1.0, "knots": 1.852, "mph": 1.609}.items(), key=lambda kv: abs(math.log(k / kv[1])))
+                    guess = f"closest unit: {unit[0]}" if abs(math.log(k / unit[1])) < 0.2 else "does not match a common unit"
+                else:
+                    k, guess = float("nan"), "too few moving pings"
+                if max(r_prev, r_next) < 0.3:
+                    print(f"     VERDICT: the reported speed does NOT follow the movement of the bus (correlation below 0.3). Do not use it for ETA until this is understood. (calculated / reported = {k:.2f} km/h per unit, {guess})")
+                else:
+                    print(f"     VERDICT: the reported speed follows the movement of the bus. calculated / reported = {k:.2f} km/h per unit ({guess}; 3.6 = m/s, 1.0 = km/h). "
+                          + ("The interval AFTER the ping fits better." if r_next > r_prev + 0.05 else "The interval BEFORE the ping fits better." if r_prev > r_next + 0.05 else ""))
         sched = df.groupby(df["schedule"].fillna("(none)")).agg(rows=("ts", "size"), trip_in_static=("trip_in_static", lambda s: pd.to_numeric(s, errors="coerce").mean()))
         print("  schedule_relationship: " + ", ".join(f"{k} {int(v.rows):,} rows (trip_id found in static: {'n/a' if pd.isna(v.trip_in_static) else f'{100 * v.trip_in_static:.0f}%'})" for k, v in sched.iterrows()))
         ex = df["extra"].dropna()
@@ -703,6 +729,14 @@ def inspect(data_dir):
             print(f"{LABEL.get(src, src)}: {len(g):,} polls, clean {100 * ok.mean():.1f}%, median download {g['latency_s'].median():.2f} s, median vehicles {g['vehicles_in_feed'].median():,.0f}, "
                   f"median file age {pd.to_numeric(g['feed_age_s'], errors='coerce').median():.0f} s")
             print(f"    problems: {probs or 'none'}")
+            gg = g[g["error"].isna()].sort_values("fetched_at").copy()
+            if len(gg) >= 20:
+                gap = gg["fetched_at"].diff().dropna(); gap = gap[gap < 60]
+                new = pd.to_numeric(gg["rows_saved"], errors="coerce") > 0
+                age = pd.to_numeric(gg["feed_age_s"], errors="coerce")
+                print(f"    polls were {gap.median():.0f} s apart; {100 * (~new).mean():.0f}% of polls brought NO new rows (the feed file had not changed). "
+                      f"File age on polls with new rows: median {age[new].median():.0f} s; without: median {age[~new].median():.0f} s; oldest file seen {age.quantile(.95):.0f} s (95th pct)"
+                      f"  -> the feed file seems to be renewed about every {age.quantile(.95):.0f} s")
         ev = h["event"].dropna()
         print(f"feed switches: {len(ev)}" + (": " + "; ".join(ev.head(5)) if len(ev) else ""))
 

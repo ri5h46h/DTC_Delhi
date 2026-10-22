@@ -32,7 +32,7 @@ IST = 19800
 
 
 def settings(a):
-    return {"version": 2, "shapes": bool(a.shapes), "on_route": a.on_route, "max_gap": a.max_gap, "run_gap": a.run_gap, "vmax": a.vmax}
+    return {"version": 3, "shapes": bool(a.shapes), "on_route": a.on_route, "max_gap": a.max_gap, "run_gap": a.run_gap, "vmax": a.vmax, "no_trip_id": bool(a.no_trip_id)}
 
 
 def say(i, n, title, plain):
@@ -228,12 +228,12 @@ def build_runs(df, a):
 
 def find_arrivals(p, runs, pats, a):
     """Step 4: where a run goes from 'before the stop' to 'after the stop', interpolate the time it passed."""
-    ts, pr = p["ts"].values, p["prog"].values
+    ts, pr, spd = p["ts"].values, p["prog"].values, p["speed_rep"].values
     idx_by_run = p.groupby("run_id").indices
-    cols = {k: [] for k in ("run_id", "stop_idx", "t", "gap", "span")}
+    cols = {k: [] for k in ("run_id", "stop_idx", "t", "gap", "span", "sa", "sb")}
     expected = 0
     for r in runs[runs["usable"]].itertuples():
-        ix = np.sort(idx_by_run[r.run_id]); t = ts[ix]
+        ix = np.sort(idx_by_run[r.run_id]); t = ts[ix]; sv = spd[ix]
         pm = np.maximum.accumulate(pr[ix])                  # progress never goes backwards (removes GPS wobble)
         P = pats[r.route_id].stop_prog
         expected += int(((P > pm[0]) & (P <= pm[-1])).sum())
@@ -246,6 +246,7 @@ def find_arrivals(p, runs, pats, a):
         k, i, j, frac, gap = k[keep], i[keep], j[keep], frac[keep], gap[keep]
         cols["run_id"].append(np.full(len(k), r.run_id)); cols["stop_idx"].append(k)
         cols["t"].append(t[i] + frac * gap); cols["gap"].append(gap); cols["span"].append(pm[j] - pm[i])
+        cols["sa"].append(sv[i]); cols["sb"].append(sv[j])
     arr = pd.DataFrame({c: (np.concatenate(v) if v else np.array([])) for c, v in cols.items()})
     if arr.empty:
         return arr, expected
@@ -258,11 +259,14 @@ def find_arrivals(p, runs, pats, a):
     arr["gap_s"] = arr["gap"].round(0).astype(int); arr["span_m"] = arr["span"].round(0).astype(int)
     arr["speed_kmh"] = (arr["span"] / arr["gap"].clip(lower=1) * 3.6).round(1)
     arr["quality"] = np.where(arr["gap"] <= 40, "good", np.where(arr["gap"] <= 90, "ok", "coarse"))
+    arr["rep_speed_a"], arr["rep_speed_b"] = arr["sa"].round(2), arr["sb"].round(2)      # raw reported speed of the ping before / after the stop
     arr = arr.sort_values(["run_id", "stop_idx"]).reset_index(drop=True)
-    return arr[["run_id", "route_id", "vehicle_id", "trip_id", "stop_idx", "stop_id", "arrive_ts", "arrive_ist", "gap_s", "span_m", "speed_kmh", "quality"]], expected
+    return arr[["run_id", "route_id", "vehicle_id", "trip_id", "stop_idx", "stop_id", "arrive_ts", "arrive_ist", "gap_s", "span_m", "speed_kmh", "quality", "rep_speed_a", "rep_speed_b"]], expected
 
 
 def process(df, pats, a, quiet=False):
+    if a.no_trip_id:
+        df = df.assign(trip_id="")                    # runs are then cut only by gaps, direction and progress jumps
     n0 = len(df)
     df = df[df["flag"].fillna("") == ""]
     if not quiet:
@@ -272,6 +276,10 @@ def process(df, pats, a, quiet=False):
         return df, df, df, 0, df, 0
     if not quiet:
         print(f"      {df['on_route'].mean() * 100:.1f}% of {len(df):,} pings are within {a.on_route:.0f} m of their route line (the rest are depot trips, diversions, wrong route_id or bad GPS)")
+        if not a.no_trip_id:
+            sz = df.groupby(["vehicle_id", "route_id", "trip_id"]).size()
+            print(f"      trip_id check: {len(sz):,} (bus, route, trip_id) groups, median {sz.median():.0f} pings each, {100 * (sz < 3).mean():.0f}% with fewer than 3 pings"
+                  "  (if most groups are tiny the trip_id changes too often: try --no-trip-id)")
         say(3, 5, "RUNS", "Each bus's pings are cut into trips; one-off position spikes are removed; a trip that moves backwards along its route is marked as a direction mismatch.")
     p, runs, spikes = build_runs(df, a)
     if not quiet:
@@ -300,6 +308,11 @@ def report(dfm, p, runs, arr, expected, spikes, pats):
     print("  quality (gap between the two pings around the stop):  " + ", ".join(f"{k} {v:,}" for k, v in arr["quality"].value_counts().items()))
     print(f"  coverage: {100 * len(arr) / max(expected, 1):.1f}% of the stops each bus drove past got an arrival time (rest skipped: pings too far apart)")
     print(f"  median gap between the pings used: {arr['gap_s'].median():.0f} s, median speed around the stop: {arr['speed_kmh'].median():.1f} km/h")
+    rm = arr[["rep_speed_a", "rep_speed_b"]].mean(axis=1)
+    mm = (rm > 1) & (arr["speed_kmh"] > 5)
+    if mm.sum() >= 100:
+        r_ = arr.loc[rm.notna(), "speed_kmh"].corr(rm[rm.notna()], method="spearman")
+        print(f"  reported speed (feed) vs speed around the stop ({int(mm.sum()):,} arrivals): rank correlation {r_:+.2f}, calculated / reported = {(arr.loc[mm, 'speed_kmh'] / rm[mm]).median():.2f} km/h per unit (3.6 = m/s, 1.0 = km/h)")
     a2 = arr.copy(); a2["pat_cum"] = [pats[r].stop_prog[k] for r, k in zip(a2["route_id"], a2["stop_idx"])]
     a2["next_t"] = a2.groupby("run_id")["arrive_ts"].shift(-1); a2["next_cum"] = a2.groupby("run_id")["pat_cum"].shift(-1)
     s = a2.dropna(subset=["next_t"]).copy(); dt = s["next_t"] - s["arrive_ts"]
@@ -319,8 +332,14 @@ def report(dfm, p, runs, arr, expected, spikes, pats):
 
 # ============================ commands ============================
 def read_clean(path):
-    df = pd.read_csv(path, usecols=["ts", "vehicle_id", "route_id", "trip_id", "lat", "lon", "flag"],
-                     dtype={"vehicle_id": str, "route_id": str, "trip_id": str, "flag": str}, low_memory=False)
+    """Reads a data/clean file of otd_collector (v2 layout, or the first test layout with speed_ms). Only the needed columns are loaded."""
+    want = {"ts", "vehicle_id", "route_id", "trip_id", "lat", "lon", "flag", "speed_rep", "speed_ms", "source"}
+    df = pd.read_csv(path, usecols=lambda c: c in want, dtype={"vehicle_id": str, "route_id": str, "trip_id": str, "flag": str, "source": str}, low_memory=False)
+    if "speed_ms" in df and "speed_rep" not in df:
+        df = df.rename(columns={"speed_ms": "speed_rep"})
+    df["speed_rep"] = pd.to_numeric(df["speed_rep"], errors="coerce") if "speed_rep" in df else np.nan    # raw value of the feed's speed field
+    if "source" not in df:
+        df["source"] = ""
     df["trip_id"] = df["trip_id"].fillna("")              # a missing trip_id must not drop the ping
     return df.dropna(subset=["vehicle_id", "route_id", "ts", "lat", "lon"])
 
@@ -331,6 +350,8 @@ def run_file(path, pats, a, outdir, quiet=False):
         print(f"\n######## {day} ########")
         say(1, 5, "LOAD", f"reading {path}")
     df = read_clean(path)
+    if not quiet and df["source"].ne("").any():
+        print("      rows by feed: " + ", ".join(f"{k} {v:,}" for k, v in df["source"].value_counts().items()))
     if a.routes:
         df = df[df["route_id"].isin(a.routes.split(","))]
     p, runs, arr, expected, dfm, spikes = process(df, pats, a, quiet=quiet)
@@ -443,24 +464,24 @@ def cmd_selftest(a):
             s = np.interp(pt, path[:, 0], path[:, 1])
             if rng.random() < 0.01: s = s + 900 if s < S[-1] - 900 else s - 900; nspike += 1
             x, y = xy(min(max(s, 0), S[-1])); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
-            rows.append((pt, f"BUS{b}", "1", f"T{b}", la, lo)); pt += rng.uniform(10, 30)
+            rows.append((pt, f"BUS{b}", "1", f"T{b}", la, lo, np.interp(pt + 1, path[:, 0], path[:, 1]) - np.interp(pt, path[:, 0], path[:, 1]))); pt += rng.uniform(10, 30)
         truths[f"BUS{b}"] = truth
     path, _ = simulate(base + 5000)
     for b in range(2):                                               # 2 buses that drive the opposite way but are labelled route 1
         pt = base + 5000 + b * 60
         while pt < path[-1, 0] + b * 60:
             s = S[-1] - np.interp(pt - b * 60, path[:, 0], path[:, 1]); x, y = xy(max(s, 0)); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
-            rows.append((pt, f"WRONG{b}", "1", "TW", la, lo)); pt += rng.uniform(10, 30)
+            rows.append((pt, f"WRONG{b}", "1", "TW", la, lo, np.nan)); pt += rng.uniform(10, 30)
     for k in range(40):                                              # a bus far away from its route line (depot trip)
-        rows.append((base + 9000 + k * 20, "DEPOT", "1", "TD", lat0 + 0.05, lon0 + 0.05))
+        rows.append((base + 9000 + k * 20, "DEPOT", "1", "TD", lat0 + 0.05, lon0 + 0.05, 0.0))
     for rep in range(2):                                             # one vehicle doing the route twice with the SAME trip_id
         off = rep * 4200; path, truth = simulate(base + 7000 + off)
         if rep == 0: truths["TWICE"] = dict(truth)
         pt = base + 7000 + off
         while pt < path[-1, 0]:
             s = np.interp(pt, path[:, 0], path[:, 1]); x, y = xy(min(s, S[-1])); la, lo = ll(x + rng.normal(0, 6), y + rng.normal(0, 6))
-            rows.append((pt, "TWICE", "1", "TT", la, lo)); pt += rng.uniform(10, 30)
-    df = pd.DataFrame(rows, columns=["ts", "vehicle_id", "route_id", "trip_id", "lat", "lon"]); df["flag"] = ""
+            rows.append((pt, "TWICE", "1", "TT", la, lo, np.interp(pt + 1, path[:, 0], path[:, 1]) - np.interp(pt, path[:, 0], path[:, 1]))); pt += rng.uniform(10, 30)
+    df = pd.DataFrame(rows, columns=["ts", "vehicle_id", "route_id", "trip_id", "lat", "lon", "speed_rep"]); df["flag"] = ""; df["source"] = "tstack"
     path_clean = tmp / "data" / "clean" / "2030-01-01.csv.gz"; df.to_csv(path_clean, index=False)
     print(f"Simulated {len(df):,} pings: 30 normal buses ({nspike} pings moved 900 m = spikes), 2 buses against their label, 1 depot bus, 1 bus with 2 trips under one trip_id.")
     a.routes = None; res = {}
@@ -492,6 +513,7 @@ def main():
     ap.add_argument("--shapes", action="store_true", help="(default now) use shapes.txt, the real road line")
     ap.add_argument("--no-shapes", action="store_true", help="use straight lines between stops instead of shapes.txt")
     ap.add_argument("--force", action="store_true", help="redo days whose arrivals are already up to date")
+    ap.add_argument("--no-trip-id", action="store_true", help="do not use trip_id to cut runs (use it if the trip_id changes too often)")
     a = ap.parse_args()
     a.shapes = not a.no_shapes
     if a.cmd == "show" and not a.vehicle:

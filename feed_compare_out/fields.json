@@ -1,0 +1,362 @@
+{
+ "A": {
+  "position.latitude": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 3501,
+   "examples": [
+    "28.625259",
+    "28.824743",
+    "28.569571"
+   ],
+   "min": 28.41676139831543,
+   "max": 28.996549606323242
+  },
+  "trip.start_time": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 311,
+   "examples": [
+    "06:41:18",
+    "07:05:24",
+    "06:20:29"
+   ],
+   "min": null,
+   "max": null
+  },
+  "position.speed": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 100.0,
+   "empty_pct": null,
+   "distinct": 1,
+   "examples": [
+    "0.000000"
+   ],
+   "min": 0.0,
+   "max": 0.0
+  },
+  "vehicle.label": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV2592",
+    "DL51EV0534",
+    "DL1PD4369"
+   ],
+   "min": null,
+   "max": null
+  },
+  "trip.start_date": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 7,
+   "examples": [
+    "20261019",
+    "20261018",
+    "20261017"
+   ],
+   "min": null,
+   "max": null
+  },
+  "vehicle.id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV2592",
+    "DL51EV0534",
+    "DL1PD4369"
+   ],
+   "min": null,
+   "max": null
+  },
+  "trip.route_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 1141,
+   "examples": [
+    "2213",
+    "1529",
+    "2189"
+   ],
+   "min": null,
+   "max": null
+  },
+  "position.longitude": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 3387,
+   "examples": [
+    "77.240631",
+    "76.982994",
+    "77.189964"
+   ],
+   "min": 76.67585754394531,
+   "max": 77.43131256103516
+  },
+  "trip.trip_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3513,
+   "examples": [
+    "2213_06_15",
+    "1529_7_5",
+    "2189_6_20"
+   ],
+   "min": null,
+   "max": null
+  },
+  "timestamp": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 170,
+   "examples": [
+    "1792374091",
+    "1792374085",
+    "1792374079"
+   ],
+   "min": 1792373669,
+   "max": 1792374091
+  },
+  "trip.schedule_relationship": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 2,
+   "examples": [
+    "SCHEDULED",
+    "ADDED"
+   ],
+   "min": null,
+   "max": null
+  },
+  "entity_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV2592",
+    "DL51EV0534",
+    "DL1PD4369"
+   ],
+   "min": null,
+   "max": null
+  }
+ },
+ "B": {
+  "position.latitude": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 3492,
+   "examples": [
+    "28.825472",
+    "28.502811",
+    "28.618105"
+   ],
+   "min": 28.416763305664062,
+   "max": 28.996522903442383
+  },
+  "trip.start_time": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 634,
+   "examples": [
+    "07:05:24",
+    "07:08:59",
+    "05:51:25"
+   ],
+   "min": null,
+   "max": null
+  },
+  "position.speed": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 6.521130702490904,
+   "empty_pct": null,
+   "distinct": 3073,
+   "examples": [
+    "3.451363",
+    "15.393193",
+    "15.638077"
+   ],
+   "min": 0.0,
+   "max": 50.0
+  },
+  "vehicle.label": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV0534",
+    "DL1PD8718",
+    "DL1PD7602"
+   ],
+   "min": null,
+   "max": null
+  },
+  "trip.start_date": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 7,
+   "examples": [
+    "20261019",
+    "20261018",
+    "20261017"
+   ],
+   "min": null,
+   "max": null
+  },
+  "vehicle.id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV0534",
+    "DL1PD8718",
+    "DL1PD7602"
+   ],
+   "min": null,
+   "max": null
+  },
+  "trip.route_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 1141,
+   "examples": [
+    "1529",
+    "3062",
+    "2885"
+   ],
+   "min": null,
+   "max": null
+  },
+  "position.longitude": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 3390,
+   "examples": [
+    "76.983955",
+    "77.179573",
+    "77.279793"
+   ],
+   "min": 76.67659759521484,
+   "max": 77.43125915527344
+  },
+  "trip.trip_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "1529_07_05_9966",
+    "3062_07_08_6209",
+    "2885_05_51_3175"
+   ],
+   "min": null,
+   "max": null
+  },
+  "timestamp": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": true,
+   "zero_pct": 0.0,
+   "empty_pct": null,
+   "distinct": 190,
+   "examples": [
+    "1792374074",
+    "1792374063",
+    "1792374062"
+   ],
+   "min": 1792373639,
+   "max": 1792374074
+  },
+  "trip.schedule_relationship": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 2,
+   "examples": [
+    "ADDED",
+    "SCHEDULED"
+   ],
+   "min": null,
+   "max": null
+  },
+  "entity_id": {
+   "present": 3573,
+   "present_pct": 100.0,
+   "numeric": false,
+   "zero_pct": null,
+   "empty_pct": 0.0,
+   "distinct": 3573,
+   "examples": [
+    "DL51EV0534",
+    "DL1PD8718",
+    "DL1PD7602"
+   ],
+   "min": null,
+   "max": null
+  }
+ }
+}

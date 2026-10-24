@@ -15,7 +15,7 @@ and shows, in plain English:
    5 extra / unknown fields                   10 summary and what it means for the project
 
 HOW TO RUN
-   1. paste your two keys below (or set env vars OTD_API_KEY and TRANSPORT_STACK_API_KEY)
+   1. paste your two keys below (or set env vars OTD_API_KEY and TSTACK_API_KEY)
    2. python compare_feeds.py                          one snapshot of each feed
       python compare_feeds.py --polls 4 --interval 15  also compare how often each feed changes
       python compare_feeds.py --offline feed_compare_out   analyse the files saved by an earlier run (no keys needed)
@@ -32,7 +32,7 @@ load_dotenv()
 
 # ============================ CONFIG: paste your keys here ============================
 OTD_API_KEY = os.getenv("OTD_API_KEY")
-TRANSPORT_STACK_API_KEY = os.getenv("TRANSPORT_STACK_API_KEY")
+TSTACK_API_KEY = os.getenv("TSTACK_API_KEY")
 # ======================================================================================
 OTD_URL = "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb"
 TS_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"
@@ -289,7 +289,7 @@ def main():
     ap.add_argument("--otd-url", default=OTD_URL); ap.add_argument("--ts-url", default=TS_URL)
     a = ap.parse_args()
     keyA = os.getenv("OTD_API_KEY") or OTD_API_KEY
-    keyB = os.getenv("TRANSPORT_STACK_API_KEY") or TRANSPORT_STACK_API_KEY
+    keyB = os.getenv("TSTACK_API_KEY") or TSTACK_API_KEY
     keys = [keyA, keyB]
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     files = {"A": "otd.pb", "B": "transportstack.pb"}

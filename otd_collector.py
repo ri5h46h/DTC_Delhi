@@ -478,7 +478,12 @@ class Collector:
         while not self.stop:
             if not self.paused or self.force:
                 self.force = False
-                res = self.cycle()
+                try:
+                    res = self.cycle()
+                except Exception as e:            # one bad poll (for example a full disk) must never stop the collector
+                    self.stats["failed"] += 1
+                    self.log("Unexpected error in a poll: " + redact(f"{type(e).__name__}: {e}")[:150] + "  (the collector keeps running)", "err")
+                    res = False
                 if res is True:
                     fails, delay = 0, self.interval
                 elif res == "empty":

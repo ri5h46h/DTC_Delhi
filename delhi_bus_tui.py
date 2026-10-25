@@ -11,7 +11,7 @@ Run:   python delhi_bus_tui.py            (live, needs API key + GTFS folder)
        python delhi_bus_tui.py --demo     (fake buses, no key or files needed)
 Press ? inside the app for keys.
 """
-import argparse, curses, math, os, pickle, random, threading, time
+import argparse, curses, math, os, pickle, random, re, threading, time
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -735,6 +735,8 @@ class App:
             self.search = {"kind": "stop", "q": "", "res": [], "i": 0}; self.mode = "search"
         elif k == ord("r"):
             self.search = {"kind": "route", "q": "", "res": [], "i": 0}; self.mode = "search"
+        elif k == ord("v"):
+            self.search = {"kind": "bus", "q": "", "res": [], "i": 0}; self.mode = "search"
         elif k == ord("x"):
             self.route = None; self.sel = None
         elif k == ord("g"): self.open_here()
@@ -786,6 +788,34 @@ class App:
             _, la, lo = self.static.stops[sid]
             self.clat, self.clon = la, lo
 
+    def search_buses(self, q, n=15):
+        """Find buses by number plate: the whole plate, or just its last digits (spaces, dashes and case do not matter)."""
+        norm = lambda t: re.sub(r"[^A-Z0-9]", "", str(t).upper())
+        qn = norm(q)
+        if not qn:
+            return []
+        exact, ends, inside = [], [], []
+        for key in self.fleet.buses:
+            kn = norm(key)
+            if kn == qn: exact.append(key)
+            elif kn.endswith(qn): ends.append(key)
+            elif qn in kn: inside.append(key)
+        return (exact + sorted(ends) + sorted(inside))[:n]
+
+    def select_bus(self, key):
+        """Select a bus found by the search: centre the map on it, so the bus panel at the bottom shows its info."""
+        b = self.fleet.buses.get(key)
+        self.mode = "map"
+        if not b:
+            self.msg = f"{key} is no longer in the feed"
+            return
+        self.sel = key
+        self.clat, self.clon = b.lat, b.lon
+        self.z = min(self.z, 3)                              # zoom in to at least 100 m per column
+        if self.route and b.route_id != self.route:
+            self.route = None                                # the route filter would hide the other buses around it
+        self.msg = f"showing bus {key}"
+
     def key_search(self, k):
         s = self.search
         if k == 27:
@@ -801,7 +831,9 @@ class App:
                 self.route = None; self.mode = "map"; return
             if s["res"]:
                 pick = s["res"][min(s["i"], len(s["res"]) - 1)]
-                if s["kind"] == "stop":
+                if s["kind"] == "bus":
+                    self.select_bus(pick)
+                elif s["kind"] == "stop":
                     self.open_board(pick)
                 else:
                     self.route = pick; self.mode = "map"
@@ -811,7 +843,9 @@ class App:
                         self.z = max(self.z, 5)
         elif 32 <= k < 127:
             s["q"] += chr(k); s["i"] = 0
-        if s["kind"] == "stop":
+        if s["kind"] == "bus":
+            s["res"] = self.search_buses(s["q"])
+        elif s["kind"] == "stop":
             s["res"] = self.static.search_stops(s["q"]) if s["q"] else []
         else:
             s["res"] = self.static.search_routes(s["q"]) if s["q"] else []
@@ -902,7 +936,7 @@ class App:
         # crosshair
         scr.put(1 + mh // 2, W // 2, "+", "bold")
         self.draw_panel(scr, H, W, mh, vis)
-        self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | r route | x clear | i fields | g Google Maps | ? help | q quit")
+        self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | v find bus | r route | x clear | i fields | g Google Maps | ? help | q quit")
 
     def speed_text(self, b):
         """reported + calculated speed (Transport Stack), or calculated only (OTD)."""
@@ -977,9 +1011,16 @@ class App:
     def draw_search(self, scr, H, W):
         s = self.search
         self.header(scr, W, " | SEARCH")
-        scr.put(2, 1, f"{'Find stop (name or id)' if s['kind'] == 'stop' else 'Route filter (number; empty + Enter clears)'}: {s['q']}_", "bold")
+        title = {"stop": "Find stop (name or id)", "bus": "Find bus by number plate (whole plate or last digits, e.g. 5635)"}.get(s["kind"], "Route filter (number; empty + Enter clears)")
+        scr.put(2, 1, f"{title}: {s['q']}_", "bold")
+        if s["kind"] == "bus" and s["q"] and not s["res"]:
+            scr.put(4, 2, f"No bus with '{s['q']}' in its number is in the feed right now (it may be off duty or not sending GPS).", "warn")
         for i, pick in enumerate(s["res"][: H - 6]):
-            if s["kind"] == "stop":
+            if s["kind"] == "bus":
+                b = self.fleet.buses.get(pick)
+                rid = (self.static.label(b.route_id) if b.route_id else "route unknown") if b else "-"
+                txt = f"{pick:<14} route {rid:<14}" + (f"{b.lat:.4f}, {b.lon:.4f}   ping {self.age(b):.0f}s ago" + ("  (stale)" if self.age(b) > STALE_S else "") if b else "")
+            elif s["kind"] == "stop":
                 nm, la, lo = self.static.stops[pick]
                 txt = f"{nm}  (id {pick})  {la:.4f}, {lo:.4f}"
             else:
@@ -1052,6 +1093,7 @@ class App:
                "  b   select next bus near centre (+)     B  deselect       Enter  all fields of selected bus",
                "  s   stop board of the stop nearest the centre             S  board for the selected bus's next stop",
                "  /   search a stop by name/id      r   show only one route (also draws its line and stops)     x  clear",
+               "  v   find a bus by its number plate: type the whole plate or only the last digits (for example 5635); Enter selects it",
                "  i   what fields does the feed fill, do IDs match      f  refresh now      q  quit",
                "  g   open the selected bus / stop / map centre in Google Maps (default browser). Or click the underlined [open in Google Maps].", "",
                "BUBBLES  (534) = bus on route 534.  o = bus whose label did not fit.  At far zoom: * one bus, 2..9 / # = many buses.",

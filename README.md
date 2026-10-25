@@ -84,7 +84,8 @@ API page: <https://delhi.transportstack.in/data-services/datadetails/7>
 ### 4. Get the static GTFS files
 
 1. Download the Delhi bus static data from <https://otd.delhi.gov.in/data/static>. [this is mostly not reachable or down]. The alternative source for the latest static GTFS Data is Transport Stack itself, visit <https://delhi.transportstack.in/data-services/datadetails/1> and the fill the form to be able to download the static data.
-2. Unzip it into a folder called `gtfs/` next to the scripts. You need `routes.txt`, `trips.txt`, `stops.txt` and `stop_times.txt`. `shapes.txt` (the real road line of each route) is used by the arrival script and is recommended.
+2. If in case, the transport stack also has some issues while downloading the static GTFS zip, i have pushed the the latest version I downloaded inside the `/data` dir in the repo.
+3. Unzip it into a folder called `gtfs/` next to the scripts. You need `routes.txt`, `trips.txt`, `stops.txt` and `stop_times.txt`. `shapes.txt` (the real road line of each route) is used by the arrival script and is recommended.
 
 Note from the OTD documentation: the times inside `stop_times.txt` are rough estimates made by assuming a constant speed. We use the files for stop lists and route lines, not for real times.
 
@@ -167,6 +168,7 @@ uv run delhi_bus_tui.py --refresh 15             # seconds between feed updates 
 | `r` | show only one route (also draws its line and stops) |
 | `x` | clear route filter and selection |
 | `i` | feed fields and ID match rates |
+| `v` | find a bus by its number plate (type the whole plate or only the last digits, for example 5635); the map centres on it and the bus panel at the bottom shows its info |
 | `g` | open the selected bus (or the stop on the stop board, or the map centre) in **Google Maps** in your default browser |
 | `f` | refresh now |
 | `?` | help |

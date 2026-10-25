@@ -16,6 +16,7 @@ venv/
 
 /data/*
 !/data/.gitkeep
+!/data/delhi_buses_static_gtfs_v1.zip
 !/data/clean/
 /data/clean/*
 !/data/clean/.gitkeep
@@ -25,3 +26,6 @@ venv/
 !/data/health/
 /data/health/*
 !/data/health/.gitkeep
+!/data/arrivals/
+/data/arrivals/*
+!/data/arrivals/.gitkeep

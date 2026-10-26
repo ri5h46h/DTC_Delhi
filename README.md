@@ -3,6 +3,9 @@
 Terminal tools for **Delhi buses (DTC and DIMTS cluster)**, built on open **GTFS static** and **GTFS-Realtime** data from the Delhi **Open Transit Data (OTD)** portal and the **Delhi Transport Stack**.
 The goal of the project is AI/ML on top of this data: ETA prediction, anomaly detection (bunching, irregular headways) and route analytics, with an interactive dashboard at the end. This project is also a submission as my third semester dissertation project for my current degree at NFSU, Gandhinagar.
 
+### Here's a quick demo of the main tracker:
+[![asciicast](https://asciinema.org/a/0wKSX0izydEBacLp.svg)](https://asciinema.org/a/0wKSX0izydEBacLp)
+
 > Status: work in progress. The four tools below work on the live feeds. The ML models and the dashboard are the next steps (see [Roadmap](#roadmap)).
 > This is an academic project (M.Tech, AI and Data Science, public transport monitoring and ETA prediction). It is **not** an official Delhi Government, DTC or DIMTS product.
 

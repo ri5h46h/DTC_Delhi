@@ -295,10 +295,18 @@ def report(dfm, p, runs, arr, expected, spikes, pats):
     bins = [-1, 50, 100, 200, 500, 1000, np.inf]; names = ["<=50 m", "50-100", "100-200", "200-500", "500-1000", ">1 km"]
     sh = pd.cut(dfm["perp"], bins, labels=names).value_counts(normalize=True).reindex(names).fillna(0)
     print("pings by distance from their route line: " + " | ".join(f"{n} {100 * v:.1f}%" for n, v in sh.items()))
-    print("   (many pings at 100-500 m = the line is too rough, try --shapes;  many above 1 km = depot trips or wrong route_id)")
+    n_shape = sum(1 for p_ in pats.values() if p_.geometry == "shape")
+    if n_shape > len(pats) / 2:
+        print("   (100-500 m can be service roads, wide junctions or old route shapes; above 1 km are usually depot trips or a wrong route_id)")
+    else:
+        print("   (many pings at 100-500 m = the line is too rough: use the real road shapes (default, needs shapes.txt); many above 1 km = depot trips or wrong route_id)")
     g = dfm.groupby("route_id").agg(n=("perp", "size"), on=("on_route", "mean"))
     g = g[g["n"] >= 100].sort_values("on").head(5)
     print("routes with the lowest share of pings on the line: " + ", ".join(f"{pats[r].short} ({100 * v.on:.0f}% of {int(v.n):,})" for r, v in g.iterrows()))
+    far = dfm[~dfm["on_route"]]
+    if len(far):
+        dshare = far["route_id"].map(lambda r_: str(pats[r_].short).startswith("D-")).mean()
+        print(f"pings far from their line (over {100} m): {len(far):,} ({100 * len(far) / len(dfm):.0f}% of all); {100 * dshare:.0f}% of them are on routes whose name starts with 'D-' (maybe depot or special trips: check route_desc in routes.txt)")
     print(f"one-off position spikes removed: {spikes:,} pings")
     u = runs["usable"].sum(); bw = (~runs["direction_ok"]).sum()
     print(f"runs: {len(runs):,}  usable {u:,}  | moving against their route_id direction: {bw:,} ({100 * bw / len(runs):.1f}%)  | too short: {len(runs) - u - bw:,}")

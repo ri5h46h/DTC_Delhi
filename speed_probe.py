@@ -132,6 +132,47 @@ def main():
             break
     if not shown:
         print("   (no bus with a clear stop-and-go moment found)")
+
+    # ---------- 8-11: do different buses use the field in different ways? ----------
+    def sig(v):                                   # a speed sent as whole km/h and divided by 3.6 gives numbers like 5.00, 3.33, 9.72
+        f = (v * 3.6) % 1
+        return (f < 0.03) | (f > 0.97)
+    df["sig"] = sig(df["rep"])
+    df["series"] = df["vehicle_id"].str.extract(r"^(.*?)\d{3,4}$")[0].fillna(df["vehicle_id"])
+    print("\n8. THE 'WHOLE KM/H' SIGNATURE")
+    print(f"   share of all numbers that are a whole number of km/h divided by 3.6 (5.00, 3.33, 9.72 ...): {100 * df['sig'].mean():.1f}%   (by pure chance about 6%)")
+    print("   -> a share far above 6% means the number is a real speed in m/s that was sent as whole km/h")
+    c = df.dropna(subset=["calc"])
+    per = c.groupby("vehicle_id").apply(lambda g: pd.Series({"n": len(g), "rho": g["rep"].corr(g["calc"], method="spearman") if len(g) >= 40 else np.nan,
+                                                             "sig": g["sig"].mean()}), include_groups=False) if len(c) else pd.DataFrame()
+    per = per[per["n"] >= 40] if len(per) else per
+    if len(per):
+        print("\n9. BUS BY BUS: rank correlation of the number with the calculated speed (buses with at least 40 pings): " + f"{len(per):,} buses")
+        edges = [-1.01, -0.5, -0.2, 0.2, 0.5, 1.01]; labs = ["below -0.5", "-0.5 to -0.2", "-0.2 to 0.2", "0.2 to 0.5", "above 0.5"]
+        hist = pd.cut(per["rho"].dropna(), edges, labels=labs).value_counts().reindex(labs).fillna(0)
+        print("   " + " | ".join(f"{k}: {int(v):,} buses ({100 * v / max(1, hist.sum()):.0f}%)" for k, v in hist.items()))
+        print(f"   buses where {'at least 80%'} of the numbers have the whole-km/h signature: {int((per['sig'] >= 0.8).sum()):,} of {len(per):,} ({100 * (per['sig'] >= 0.8).mean():.0f}%)")
+        print("   -> two clearly different groups of buses (some positive, some negative) would mean the field is used in different ways")
+        print("\n10. BY NUMBER-PLATE SERIES (the letters before the last digits; maybe different devices or bus types)")
+        c = c.assign(rho=c["vehicle_id"].map(per["rho"]))
+        rows = []
+        for ser, g in c.groupby("series"):
+            if len(g) < 5000:
+                continue
+            rows.append((ser, g["vehicle_id"].nunique(), len(g), g["rep"].corr(g["calc"], method="spearman"), 100 * g["sig"].mean(),
+                         g.loc[g["calc"] < 2, "rep"].median(), g.loc[g["calc"] > 15, "rep"].median()))
+        print("   series      buses    pings   corr    whole-km/h%   number when standing   number when moving fast (>15 km/h)")
+        for r in sorted(rows, key=lambda x: -x[2])[:12]:
+            print(f"   {r[0]:<10} {r[1]:>6,} {r[2]:>8,}  {r[3]:+.2f}   {r[4]:>9.0f}%   {r[5]:>14.1f}   {r[6]:>22.1f}")
+        print("   -> if one series has a positive correlation and a high whole-km/h share and another has a negative one, the field means different things for different series")
+        print("\n11. TWO CONTRASTING BUSES (most positive and most negative correlation)")
+        for label, vid in (("MOST POSITIVE", per["rho"].idxmax()), ("MOST NEGATIVE", per["rho"].idxmin())):
+            g = df[df["vehicle_id"] == vid].iloc[10:24]
+            print(f"   {label}: bus {vid} (correlation {per.loc[vid, 'rho']:+.2f})")
+            print("      time IST  secs  moved_m  calc_km/h  feed_number  feed_number x 3.6")
+            for _, row in g.iterrows():
+                clk = pd.to_datetime(row["ts"] + IST, unit="s").strftime("%H:%M:%S")
+                print(f"      {clk}  {row['dt_s'] if pd.notna(row['dt_s']) else '-':>4}  {row['moved_m'] if pd.notna(row['moved_m']) else '-':>7}  {row['calc'] if pd.notna(row['calc']) else float('nan'):>9.0f}  {row['rep']:>11.2f}  {row['rep'] * 3.6:>14.1f}")
     print("\nSend this whole output back, so the meaning of the number can be decided from the evidence.")
 
 

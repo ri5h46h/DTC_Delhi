@@ -13,12 +13,14 @@ It prints numbers and a short reading of them. It proves nothing by itself: it t
    python speed_probe.py --buses 3             show the pings of 3 buses around a stop-and-go moment
 """
 import argparse
+import warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
 IST = 19800
-WANT = {"ts", "vehicle_id", "source", "speed_rep", "speed_ms", "dt_s", "moved_m", "speed_calc_kmh", "age_s", "lat", "lon"}
+warnings.filterwarnings("ignore")
+WANT = {"ts", "vehicle_id", "source", "speed_rep", "speed_ms", "dt_s", "moved_m", "speed_calc_kmh", "age_s", "lat", "lon", "start_date", "start_time"}
 
 
 def load(data, date):
@@ -29,7 +31,7 @@ def load(data, date):
         raise SystemExit(f"No files in {data}/clean (date filter: {date}).")
     parts = []
     for f in files:
-        df = pd.read_csv(f, usecols=lambda c: c in WANT, dtype={"vehicle_id": str, "source": str}, low_memory=False)
+        df = pd.read_csv(f, usecols=lambda c: c in WANT, dtype={"vehicle_id": str, "source": str, "start_date": str, "start_time": str}, low_memory=False)
         if "speed_ms" in df and "speed_rep" not in df:
             df = df.rename(columns={"speed_ms": "speed_rep"})
         parts.append(df)
@@ -136,22 +138,26 @@ def main():
     # ---------- 8-11: do different buses use the field in different ways? ----------
     def sig(v):                                   # a speed sent as whole km/h and divided by 3.6 gives numbers like 5.00, 3.33, 9.72
         f = (v * 3.6) % 1
-        return (f < 0.03) | (f > 0.97)
+        return ((f < 0.03) | (f > 0.97)) & (v > 0)    # zero does not count: a parked bus that sends 0.00 would match trivially
     df["sig"] = sig(df["rep"])
     df["series"] = df["vehicle_id"].str.extract(r"^(.*?)\d{3,4}$")[0].fillna(df["vehicle_id"])
     print("\n8. THE 'WHOLE KM/H' SIGNATURE")
-    print(f"   share of all numbers that are a whole number of km/h divided by 3.6 (5.00, 3.33, 9.72 ...): {100 * df['sig'].mean():.1f}%   (by pure chance about 6%)")
+    nz_ = df[df["rep"] > 0]
+    print(f"   share of the NON-ZERO numbers that are a whole number of km/h divided by 3.6 (5.00, 3.33, 9.72 ...): {100 * nz_['sig'].mean():.1f}%   (by pure chance about 6%)")
     print("   -> a share far above 6% means the number is a real speed in m/s that was sent as whole km/h")
     c = df.dropna(subset=["calc"])
     per = c.groupby("vehicle_id").apply(lambda g: pd.Series({"n": len(g), "rho": g["rep"].corr(g["calc"], method="spearman") if len(g) >= 40 else np.nan,
-                                                             "sig": g["sig"].mean()}), include_groups=False) if len(c) else pd.DataFrame()
+                                                             "sig": (g.loc[g["rep"] > 0, "sig"].mean() if (g["rep"] > 0).sum() >= 15 else np.nan)}), include_groups=False) if len(c) else pd.DataFrame()
     per = per[per["n"] >= 40] if len(per) else per
     if len(per):
         print("\n9. BUS BY BUS: rank correlation of the number with the calculated speed (buses with at least 40 pings): " + f"{len(per):,} buses")
         edges = [-1.01, -0.5, -0.2, 0.2, 0.5, 1.01]; labs = ["below -0.5", "-0.5 to -0.2", "-0.2 to 0.2", "0.2 to 0.5", "above 0.5"]
         hist = pd.cut(per["rho"].dropna(), edges, labels=labs).value_counts().reindex(labs).fillna(0)
         print("   " + " | ".join(f"{k}: {int(v):,} buses ({100 * v / max(1, hist.sum()):.0f}%)" for k, v in hist.items()))
-        print(f"   buses where {'at least 80%'} of the numbers have the whole-km/h signature: {int((per['sig'] >= 0.8).sum()):,} of {len(per):,} ({100 * (per['sig'] >= 0.8).mean():.0f}%)")
+        withnz = per["sig"].notna()
+        print(f"   among the {int(withnz.sum()):,} buses with at least 15 non-zero numbers: {int((per['sig'] >= 0.8).sum()):,} ({100 * (per['sig'] >= 0.8).sum() / max(1, withnz.sum()):.0f}%) have the whole-km/h signature on at least 80% of their non-zero numbers")
+        zero_bus = c.groupby("vehicle_id")["rep"].apply(lambda x: (x == 0).mean())
+        print(f"   buses where at least 80% of the numbers are exactly 0 (parked?): {int((zero_bus >= 0.8).sum()):,} of {len(zero_bus):,}")
         print("   -> two clearly different groups of buses (some positive, some negative) would mean the field is used in different ways")
         print("\n10. BY NUMBER-PLATE SERIES (the letters before the last digits; maybe different devices or bus types)")
         c = c.assign(rho=c["vehicle_id"].map(per["rho"]))
@@ -173,6 +179,18 @@ def main():
             for _, row in g.iterrows():
                 clk = pd.to_datetime(row["ts"] + IST, unit="s").strftime("%H:%M:%S")
                 print(f"      {clk}  {row['dt_s'] if pd.notna(row['dt_s']) else '-':>4}  {row['moved_m'] if pd.notna(row['moved_m']) else '-':>7}  {row['calc'] if pd.notna(row['calc']) else float('nan'):>9.0f}  {row['rep']:>11.2f}  {row['rep'] * 3.6:>14.1f}")
+    if "start_date" in df and df["start_date"].notna().any():
+        print("\n12. IS THE BUS IN SERVICE TODAY? (trip start date = the day of the ping, or an older day)")
+        df["ping_day"] = pd.to_datetime(df["ts"] + IST, unit="s").dt.strftime("%Y%m%d")
+        df["today"] = df["start_date"].astype(str).str.strip() == df["ping_day"]
+        print("   group                      buses    pings   corr   number when standing   number when moving fast   whole-km/h% (non-zero)   exactly 0%")
+        for name, g in (("trip started today", df[df["today"]]), ("trip started earlier", df[~df["today"]])):
+            gc = g.dropna(subset=["calc"])
+            if len(gc) < 1000:
+                print(f"   {name:<24} (too few pings: {len(g):,})"); continue
+            nzg = g[g["rep"] > 0]
+            print(f"   {name:<24} {g['vehicle_id'].nunique():>6,} {len(g):>8,}  {gc['rep'].corr(gc['calc'], method='spearman'):+.2f}   {gc.loc[gc['calc'] < 2, 'rep'].median():>14.1f}   {gc.loc[gc['calc'] > 15, 'rep'].median():>20.1f}   {100 * nzg['sig'].mean():>16.0f}%   {100 * (g['rep'] == 0).mean():>9.0f}%")
+        print("   -> if the two groups behave very differently, the field depends on whether the bus is in service")
     print("\nSend this whole output back, so the meaning of the number can be decided from the evidence.")
 
 

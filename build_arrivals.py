@@ -32,7 +32,7 @@ IST = 19800
 
 
 def settings(a):
-    return {"version": 3, "shapes": bool(a.shapes), "on_route": a.on_route, "max_gap": a.max_gap, "run_gap": a.run_gap, "vmax": a.vmax, "no_trip_id": bool(a.no_trip_id)}
+    return {"version": 4, "pings": not a.no_pings, "shapes": bool(a.shapes), "on_route": a.on_route, "max_gap": a.max_gap, "run_gap": a.run_gap, "vmax": a.vmax, "no_trip_id": bool(a.no_trip_id)}
 
 
 def say(i, n, title, plain):
@@ -254,6 +254,7 @@ def find_arrivals(p, runs, pats, a):
     arr = arr.join(info, on="run_id")
     arr["stop_id"] = [pats[r].stop_ids[k] for r, k in zip(arr["route_id"], arr["stop_idx"].astype(int))]
     arr["stop_idx"] = arr["stop_idx"].astype(int)
+    arr["stop_prog_m"] = [round(float(pats[r_].stop_prog[k_]), 1) for r_, k_ in zip(arr["route_id"], arr["stop_idx"])]      # metres along the route
     arr["arrive_ts"] = arr["t"].round(1)
     arr["arrive_ist"] = pd.to_datetime(arr["t"] + IST, unit="s").dt.strftime("%H:%M:%S")
     arr["gap_s"] = arr["gap"].round(0).astype(int); arr["span_m"] = arr["span"].round(0).astype(int)
@@ -261,7 +262,7 @@ def find_arrivals(p, runs, pats, a):
     arr["quality"] = np.where(arr["gap"] <= 40, "good", np.where(arr["gap"] <= 90, "ok", "coarse"))
     arr["rep_speed_a"], arr["rep_speed_b"] = arr["sa"].round(2), arr["sb"].round(2)      # raw reported speed of the ping before / after the stop
     arr = arr.sort_values(["run_id", "stop_idx"]).reset_index(drop=True)
-    return arr[["run_id", "route_id", "vehicle_id", "trip_id", "stop_idx", "stop_id", "arrive_ts", "arrive_ist", "gap_s", "span_m", "speed_kmh", "quality", "rep_speed_a", "rep_speed_b"]], expected
+    return arr[["run_id", "route_id", "vehicle_id", "trip_id", "stop_idx", "stop_id", "arrive_ts", "arrive_ist", "gap_s", "span_m", "speed_kmh", "quality", "rep_speed_a", "rep_speed_b", "stop_prog_m"]], expected
 
 
 def process(df, pats, a, quiet=False):
@@ -368,6 +369,13 @@ def run_file(path, pats, a, outdir, quiet=False):
     outdir.mkdir(parents=True, exist_ok=True)
     arr.to_csv(outdir / f"{day}_arrivals.csv.gz", index=False)
     runs.to_csv(outdir / f"{day}_runs.csv.gz", index=False)
+    if not a.no_pings:                                   # the pings with their progress along the route: input of eta_eval.py
+        pg = p[["run_id", "route_id", "vehicle_id", "ts", "prog", "speed_rep"]].sort_values(["run_id", "ts"]).reset_index(drop=True)
+        same = pg["run_id"] == pg["run_id"].shift(1)
+        dt_ = pg["ts"] - pg["ts"].shift(1)
+        pg["calc_route_kmh"] = ((pg["prog"] - pg["prog"].shift(1)) / dt_ * 3.6).where(same & dt_.between(15, 120)).round(1)   # speed along the route since the previous ping
+        pg["prog"] = pg["prog"].round(1)
+        pg.to_csv(outdir / f"{day}_pings.csv.gz", index=False)
     (outdir / f"{day}_settings.json").write_text(json.dumps(settings(a)))
     if not quiet:
         say(5, 5, "SAVE", f"writing files into {outdir}/")
@@ -521,6 +529,7 @@ def main():
     ap.add_argument("--shapes", action="store_true", help="(default now) use shapes.txt, the real road line")
     ap.add_argument("--no-shapes", action="store_true", help="use straight lines between stops instead of shapes.txt")
     ap.add_argument("--force", action="store_true", help="redo days whose arrivals are already up to date")
+    ap.add_argument("--no-pings", action="store_true", help="do not save the pings file (needed by eta_eval.py)")
     ap.add_argument("--no-trip-id", action="store_true", help="do not use trip_id to cut runs (use it if the trip_id changes too often)")
     a = ap.parse_args()
     a.shapes = not a.no_shapes

@@ -13,7 +13,8 @@ venv/
 .idea/
 
 # ignoring the /data dir
-
+/models/*
+!/models/.gitkeep
 /data/*
 !/data/.gitkeep
 !/data/delhi_buses_static_gtfs_v1.zip

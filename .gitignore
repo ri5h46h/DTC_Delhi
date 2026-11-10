@@ -12,6 +12,11 @@ venv/
 .vscode/
 .idea/
 
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
 # ignoring the /data dir
 /models/*
 !/models/.gitkeep

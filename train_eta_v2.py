@@ -206,3 +206,159 @@ def prepare(a):
     if len(cases) < 3000:
         raise SystemExit(f"Only {len(cases):,} cases. Collect and process more data (or use a smaller --step).")
     return cases, arr
+
+# ---------------------------------------------------------------- final model: time split, ranges, ablations
+def run_final(a, cases, arr, backend):
+    c1, c2 = cases["ts"].quantile(0.6), cases["ts"].quantile(0.8)
+    tr, va, te = cases[cases["ts"] < c1], cases[(cases["ts"] >= c1) & (cases["ts"] < c2)], cases[cases["ts"] >= c2]
+    print(f"2. CASES     {len(cases):,}: train {len(tr):,}, validation {len(va):,}, test {len(te):,} (test = after {pd.to_datetime(c2 + 19800, unit='s'):%d %b %H:%M} IST)")
+    L = learn(tr, arr[arr["arrive_ts"] < c1], arr)
+    print(f"3. LEARN     typical speed {L.v_global * 3.6:.0f} km/h; {len(L.v_route):,} routes; stop-to-stop times of {len(L.tables):,} routes; {len(L.events):,} observed stop-to-stop times; "
+          f"time-of-day factors for {len(L.tod)} hour groups")
+    sub = tr.sample(min(len(tr), a.max_train), random_state=0) if len(tr) > a.max_train else tr
+    sub, va, te = add_feats(sub, L), add_feats(va, L), add_feats(te, L)
+    ev = te.copy()
+    ev["r_hist_tod"] = ev["base"]; ev["r_hist"] = ev["hist_eta"].fillna(ev["eta_route"]); ev["r_route"] = ev["eta_route"]
+    ev["r_calc"] = ev["dist"] / (ev["v1"] / 3.6).clip(2, 14).fillna(L.v_global); ev["r_feed"] = ev["dist"] / ev["rep"].clip(2, 14).fillna(L.v_global)
+    rules, models = [], {}
+
+    def train(name, col, feats, kind="l1", alpha=0.5, store=None):
+        print(f"4. TRAIN     {name} ...")
+        m, pr = fit_model(sub[feats].astype("float32"), to_target(sub, a.target), va[feats].astype("float32"), to_target(va, a.target), backend, kind, alpha)
+        ev[col] = from_pred(ev, pr(ev[feats].astype("float32")), a.target)
+        if store:
+            models[store] = (m, feats)
+        return m
+    main = train("main model (all inputs)", "r_ai", FEATURES, store="point"); rules.append(("AI model v2 (all inputs)", "r_ai"))
+    if not a.no_ablation:
+        train("without the feed number", "r_ai_nofeed", [f for f in FEATURES if f != "rep"]); rules.append(("AI v2 without feed number", "r_ai_nofeed"))
+        train("without the recent-buses inputs", "r_ai_norecent", [f for f in FEATURES if f not in RECENT]); rules.append(("AI v2 without recent-buses inputs", "r_ai_norecent"))
+    rules += [("historical x time of day", "r_hist_tod"), ("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
+
+    print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
+    print(f"   {'rule':<36}{'mean error':>11}{'typical error':>14}{'bias':>9}{'within 1 min':>14}{'within 2 min':>14}")
+    rows = sorted(((n, metrics(ev[c].values, ev["actual"].values)) for n, c in rules), key=lambda x: x[1]["mae"])
+    for n, m in rows:
+        print(f"   {n:<36}{m['mae']:>9.0f} s{m['med']:>12.0f} s{m['bias']:>+7.0f} s{m['w60']:>12.0f}%{m['w120']:>13.0f}%")
+    base = min(m["mae"] for n, m in rows if not n.startswith("AI")); mm = metrics(ev["r_ai"].values, ev["actual"].values)["mae"]
+    gain = 100 * (base - mm) / base
+    print(f"   -> the AI model's mean error is {abs(gain):.0f}% {'lower (better)' if gain >= 0 else 'higher (worse)'} than the best simple rule ({base:.0f} s)")
+    show = [r for r in rules if r[1] in ("r_ai", "r_hist_tod", "r_hist", "r_route")]
+    print("\nBY HOW FAR AHEAD THE STOP IS (mean error in seconds)")
+    groups = [("1 stop", ev["h"] == 1), ("2 stops", ev["h"] == 2), ("3-4 stops", ev["h"].between(3, 4)), (f"5-{a.hmax}", ev["h"] >= 5)]
+    print(f"   {'rule':<36}" + "".join(f"{n:>11}" for n, _ in groups))
+    for n, c in show:
+        print(f"   {n:<36}" + "".join(f"{np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):>9.0f} s" for _, m in groups))
+    print("\nBY WHAT THE BUS DOES AT THE MOMENT")
+    for name, m in (("standing (under 2 km/h)", ev["v1"] < 2), ("moving (5 km/h or more)", ev["v1"] >= 5)):
+        if m.sum() >= 500:
+            print(f"   {name}: {int(m.sum()):,} cases   " + "   ".join(f"{n}: {np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):.0f} s" for n, c in show))
+
+    print("\nPER-ROUTE CHECK (routes with enough test cases): where is the model worse than the historical ETA?")
+    ev["e_ai"] = (ev["r_ai"] - ev["actual"]).abs(); ev["e_hist"] = (ev["r_hist"] - ev["actual"]).abs()
+    pr = ev.groupby("route_id").agg(n=("actual", "size"), ai=("e_ai", "mean"), hist=("e_hist", "mean"))
+    pr = pr[pr["n"] >= max(100, len(ev) // 3000)]
+    if len(pr):
+        print(f"   {len(pr):,} routes: the model is better on {100 * (pr['ai'] < pr['hist']).mean():.0f}% of them")
+        print("   worst routes for the model (cases, model error, historical error):")
+        for r, v in pr.assign(d=pr["ai"] - pr["hist"]).sort_values("d", ascending=False).head(6).iterrows():
+            print(f"     route_id {r:<8}{int(v['n']):>8,} cases   {v['ai']:>5.0f} s   {v['hist']:>5.0f} s")
+
+    if not a.no_ranges:
+        lo_a, hi_a = a.low, a.high
+        print(f"\nPREDICTION RANGES (a lower and an upper guess; the range should hold the real time about {100 * (hi_a - lo_a):.0f}% of the time)")
+        residual_feats = FEATURES
+        mlo, plo = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", lo_a, quiet=True)
+        mhi, phi = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", hi_a, quiet=True)
+        ev["lo"] = ev["base"].values + plo(ev[residual_feats].astype("float32")); ev["hi"] = ev["base"].values + phi(ev[residual_feats].astype("float32"))
+        ev["hi"] = np.maximum(ev["hi"], ev["lo"] + 1)
+        before = ((ev["actual"] >= ev["lo"]) & (ev["actual"] <= ev["hi"])).mean()
+        # calibration on the validation part: widen both ends by the amount that makes the range hold the real time as often as wanted
+        vlo = va["base"].values + plo(va[residual_feats].astype("float32")); vhi = np.maximum(va["base"].values + phi(va[residual_feats].astype("float32")), vlo + 1)
+        score = np.maximum(vlo - va["actual"].values, va["actual"].values - vhi)
+        want = hi_a - lo_a
+        hg = lambda h: np.where(h <= 2, h, np.where(h <= 4, 3, 4))           # groups of stops ahead: 1, 2, 3-4, 5 or more
+        qfun = lambda sc: float(np.quantile(sc, min(1.0, np.ceil((len(sc) + 1) * want) / len(sc))))
+        qall, qg = qfun(score), {}
+        for g in (1, 2, 3, 4):
+            m_ = hg(va["h"].values) == g
+            qg[g] = qfun(score[m_]) if m_.sum() >= 200 else qall
+        qhat = qall
+        widen = np.array([qg[g] for g in hg(ev["h"].values)])
+        ev["lo"], ev["hi"] = ev["lo"] - widen, ev["hi"] + widen
+        inside = (ev["actual"] >= ev["lo"]) & (ev["actual"] <= ev["hi"])
+        print(f"   before calibration the range held the real time in {100 * before:.0f}% of the test cases; the ends were widened (calibrated on the validation part, separately for 1, 2, 3-4 and 5+ stops ahead: by " + ", ".join(f"{qg[g]:.0f} s" for g in (1, 2, 3, 4)) + ")")
+        print(f"   range holds the real time in {100 * inside.mean():.0f}% of the test cases (wanted about {100 * want:.0f}%); typical width {np.median(ev['hi'] - ev['lo']):.0f} s")
+        print(f"   {'':<14}" + "".join(f"{n:>11}" for n, _ in groups))
+        print(f"   {'holds':<14}" + "".join(f"{100 * inside[m].mean():>10.0f}%" for _, m in groups))
+        print(f"   {'width (s)':<14}" + "".join(f"{np.median((ev['hi'] - ev['lo'])[m]):>11.0f}" for _, m in groups))
+        models["low"], models["high"] = (mlo, residual_feats), (mhi, residual_feats)
+
+    print("\nWHAT THE MODEL USES MOST")
+    if backend == "lightgbm":
+        imp = dict(zip(FEATURES, main.feature_importance("gain"))); tot = sum(imp.values()) or 1
+        for k, v in sorted(imp.items(), key=lambda x: -x[1])[:10]:
+            print(f"   {k:<14}{100 * v / tot:>6.1f}%")
+    else:
+        from sklearn.inspection import permutation_importance
+        s = ev.sample(min(len(ev), 20000), random_state=0)
+        r = permutation_importance(main, s[FEATURES].astype("float32"), to_target(s, a.target), n_repeats=1, random_state=0, scoring="neg_mean_absolute_error")
+        for k, v in sorted(zip(FEATURES, r.importances_mean), key=lambda x: -x[1])[:10]:
+            print(f"   {k:<14} error grows by {v:>6.1f} s if this input is shuffled")
+    out = Path(a.out); out.mkdir(exist_ok=True)
+    (out / "eta_v2_models.pkl").write_bytes(pickle.dumps({"backend": backend, "target": a.target, "models": {k: v[0] for k, v in models.items()}, "features": {k: v[1] for k, v in models.items()}}))
+    (out / "eta_v2_tables.pkl").write_bytes(pickle.dumps({"v_global": L.v_global, "v_route": L.v_route, "med": L.med, "tables": L.tables, "tod": L.tod}))
+    (out / "eta_v2_info.json").write_text(json.dumps({"backend": backend, "target": a.target, "features": FEATURES, "test_mean_error_s": round(float(mm), 1), "cases": len(cases)}, indent=1))
+    if not a.no_ranges:
+        (out / "eta_v2_calibration.json").write_text(json.dumps({"low_q": a.low, "high_q": a.high, "widen_s_by_stops_ahead_1_2_3to4_5plus": [round(qg[g], 1) for g in (1, 2, 3, 4)]}))
+    print(f"\nSaved the models and the learned tables in {out}/")
+
+
+# ---------------------------------------------------------------- leave-one-day-out
+def run_cv(a, cases, arr, backend):
+    cases = cases.assign(day=day_of(cases["ts"]))
+    cnt = cases["day"].value_counts()
+    days = sorted(d for d, n in cnt.items() if n >= max(2000, 0.02 * len(cases)))
+    if len(days) < 3:
+        raise SystemExit("Leave-one-day-out needs at least 3 days with enough cases.")
+    print(f"2. CASES     {len(cases):,} cases on {len(days)} days. Each day is tested with a model trained on all the other days.\n")
+    print(f"   {'day':<12}{'cases':>9}{'AI v2':>9}{'historical x tod':>18}{'historical':>12}{'route typical':>15}{'AI gain vs best simple':>25}")
+    rows = []
+    for d in days:
+        te, trn = cases[cases["day"] == d], cases[cases["day"] != d]
+        L = learn(trn, arr[day_of(arr["arrive_ts"]) != d], arr)
+        trn = trn.sample(min(len(trn), a.max_train), random_state=0)
+        va = trn.sample(frac=0.1, random_state=1); tr2 = trn.drop(va.index)
+        tr2, va, te = add_feats(tr2, L), add_feats(va, L), add_feats(te, L)
+        m, pr = fit_model(tr2[FEATURES].astype("float32"), to_target(tr2, a.target), va[FEATURES].astype("float32"), to_target(va, a.target), backend, quiet=True)
+        ai = from_pred(te, pr(te[FEATURES].astype("float32")), a.target)
+        res = dict(ai=metrics(ai, te["actual"].values)["mae"], ht=metrics(te["base"].values, te["actual"].values)["mae"],
+                   h=metrics(te["hist_eta"].fillna(te["eta_route"]).values, te["actual"].values)["mae"], rt=metrics(te["eta_route"].values, te["actual"].values)["mae"])
+        best = min(res["ht"], res["h"], res["rt"])
+        rows.append((d, len(te), res, best))
+        print(f"   {pd.to_datetime(d * 86400, unit='s'):%a %d %b}  {len(te):>9,}{res['ai']:>7.0f} s{res['ht']:>16.0f} s{res['h']:>10.0f} s{res['rt']:>13.0f} s{100 * (best - res['ai']) / best:>22.0f}%")
+    gains = [100 * (b - r["ai"]) / b for _, _, r, b in rows]
+    print(f"\n   average gain of the AI model over the best simple rule: {np.mean(gains):.0f}% (best day {max(gains):.0f}%, worst day {min(gains):.0f}%)")
+    print(f"   average mean error: AI v2 {np.mean([r['ai'] for _, _, r, _ in rows]):.0f} s, historical x time of day {np.mean([r['ht'] for _, _, r, _ in rows]):.0f} s, "
+          f"historical {np.mean([r['h'] for _, _, r, _ in rows]):.0f} s, route typical {np.mean([r['rt'] for _, _, r, _ in rows]):.0f} s")
+    print("   (each day is tested with history learned from the OTHER days, which may include later days: it shows how well the model works on a new day)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ETA model, version 2")
+    ap.add_argument("--arrivals", default="data/arrivals"); ap.add_argument("--date")
+    ap.add_argument("--step", type=int, default=6); ap.add_argument("--hmax", type=int, default=6)
+    ap.add_argument("--max-train", type=int, default=1_200_000); ap.add_argument("--backend", choices=["auto", "lightgbm", "sklearn"], default="auto")
+    ap.add_argument("--mode", choices=["final", "cv"], default="final"); ap.add_argument("--target", choices=["residual", "ratio", "raw"], default="residual")
+    ap.add_argument("--no-ablation", action="store_true"); ap.add_argument("--no-ranges", action="store_true")
+    ap.add_argument("--low", type=float, default=0.1); ap.add_argument("--high", type=float, default=0.9); ap.add_argument("--out", default="models")
+    a = ap.parse_args()
+    backend = pick_backend(a.backend)
+    print(f"model: {'LightGBM' if backend == 'lightgbm' else 'scikit-learn HistGradientBoosting'}   target: {a.target}   mode: {a.mode}")
+    cases, arr = prepare(a)
+    (run_final if a.mode == "final" else run_cv)(a, cases, arr, backend)
+    print("\nSend this whole output back.")
+
+
+if __name__ == "__main__":
+    main()

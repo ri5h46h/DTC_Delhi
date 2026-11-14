@@ -630,6 +630,8 @@ class App:
         self.stop = None               # selected stop id
         self.route = None              # route filter (route_id)
         self.board_i = 0
+        self.board_key = None          # bus key highlighted on the stop board (the highlight follows the bus, not the row number)
+        self.board_scroll = 0
         self.unres_i = 0               # selected row in unresolved buses view
         self.unres_key = None          # plate of the highlighted unresolved bus (the highlight follows the bus, not the row number)
         self.scroll = 0
@@ -729,12 +731,21 @@ class App:
             return
         if self.mode == "board":
             rows = self.fleet.stop_board(self.stop)
+            self.board_sync(rows)
             if k in (27, ord("q")):
                 self.mode = "map"
-            elif k == curses.KEY_DOWN:
+            elif k in (curses.KEY_DOWN, ord("j")):
                 self.board_i = min(self.board_i + 1, max(0, len(rows) - 1))
-            elif k == curses.KEY_UP:
+            elif k in (curses.KEY_UP, ord("k")):
                 self.board_i = max(0, self.board_i - 1)
+            elif k == curses.KEY_NPAGE:
+                self.board_i = min(self.board_i + 10, max(0, len(rows) - 1))
+            elif k == curses.KEY_PPAGE:
+                self.board_i = max(0, self.board_i - 10)
+            elif k == curses.KEY_HOME:
+                self.board_i = 0
+            elif k == curses.KEY_END:
+                self.board_i = max(0, len(rows) - 1)
             elif k in (ord("\n"), curses.KEY_ENTER) and rows:
                 b = rows[min(self.board_i, len(rows) - 1)]["bus"]
                 self.sel = b.key; self.clat, self.clon = b.lat, b.lon; self.mode = "map"
@@ -744,6 +755,9 @@ class App:
                 self.open_here()
             elif k == ord("f"):
                 self.force.set()
+            if rows:
+                self.board_i = max(0, min(self.board_i, len(rows) - 1))
+                self.board_key = self._rk(rows[self.board_i])
             return
         # ---- map mode ----
         step_c = max(3, W // 8)
@@ -838,9 +852,22 @@ class App:
         k = int(np.searchsorted(a.pat.cum, a.prog - 1))
         return a.pat.stop_ids[min(k, len(a.pat.stop_ids) - 1)]
 
+    @staticmethod
+    def _rk(r):
+        return (r["bus"].key, r["route"], r["to"])
+
+    def board_sync(self, rows):
+        """Keep the highlight on the same bus when the live list changes."""
+        keys = [self._rk(r) for r in rows]
+        if self.board_key in keys:
+            self.board_i = keys.index(self.board_key)
+        self.board_i = max(0, min(self.board_i, len(rows) - 1)) if rows else 0
+        self.board_key = self._rk(rows[self.board_i]) if rows else None
+
     def open_board(self, sid):
         if sid:
             self.stop, self.board_i, self.mode = sid, 0, "board"
+            self.board_key = None; self.board_scroll = 0
             _, la, lo = self.static.stops[sid]
             self.clat, self.clon = la, lo
 
@@ -1055,15 +1082,26 @@ class App:
         rows = self.fleet.stop_board(sid)
         if not rows:
             scr.put(7, 1, "No tracked bus is approaching this stop right now (or buses cannot be matched to routes).", "warn")
-        for i, r in enumerate(rows[: H - 9]):
+        n_total = len(rows)
+        self.board_sync(rows)
+        vis_h = max(1, H - 10)
+        if self.board_i < self.board_scroll:
+            self.board_scroll = self.board_i
+        elif self.board_i >= self.board_scroll + vis_h:
+            self.board_scroll = self.board_i - vis_h + 1
+        self.board_scroll = max(0, min(self.board_scroll, max(0, n_total - vis_h)))
+        for i, r in enumerate(rows[self.board_scroll: self.board_scroll + vis_h]):
+            idx = self.board_scroll + i
             eta = r["eta_s"]
             e = "due" if eta < 45 else f"{eta / 60:.0f} min"
             f1 = lambda x: "-" if x is None else f"{x:.0f}"
             line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 8]:<{TW}}{e:>8}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
                     + f"{f1(r['calc']):>7}  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}")
-            scr.put(6 + i, 1, line, "rev" if i == self.board_i else self.style_for(r["route"]))
+            scr.put(6 + i, 1, line, "rev" if idx == self.board_i else self.style_for(r["route"]))
+        if n_total:
+            scr.put(H - 4, 1, f"Showing {self.board_scroll + 1}-{min(n_total, self.board_scroll + vis_h)} of {n_total} entries (updates live)", "bold")
         scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
-        self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
+        self.footer(scr, H, "Up/Down/PgUp/PgDn choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
 
     def draw_unresolved(self, scr, H, W):
         self.header(scr, W, " | UNRESOLVED BUSES")

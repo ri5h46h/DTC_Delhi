@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-import os
 import webbrowser
 from dotenv import load_dotenv
 
@@ -26,7 +25,7 @@ load_dotenv()
 
 # ========================= CONFIG (edit these) =========================
 TSTACK_API_KEY = os.getenv("TSTACK_API_KEY")   # <-- paste your Delhi Transport Stack key (default feed)
-OTD_API_KEY = os.getenv("OTD_API_KEY")                    # <-- paste your OTD Delhi key (--using-otd, and as the fallback feed)
+OTD_API_KEY = os.getenv("OTD_API_KEY")         # <-- paste your OTD Delhi key (--using-otd, and as the fallback feed)
 GTFS_DIR = "gtfs"                        # folder with routes.txt, trips.txt, stops.txt, stop_times.txt
 TSTACK_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"      # key goes in the x-api-key header
 TSTACK_PARAMS = {"agency": "delhi-buses", "category": "realtime_gtfs", "filename": "VehiclePositions.pb"}
@@ -277,6 +276,17 @@ class Fleet:
         self.buses, self.by_route, self.rows = new, by_route, rows
         self.snap += 1
         self.last_ok, self.last_err, self.header_ts = now, None, header_ts
+
+    def unresolved_buses(self):
+        """Return all live buses that could not be matched to a route in static GTFS."""
+        rows = [b for b in self.buses.values() if not b.route_id]
+        rows.sort(key=lambda b: (
+            b.row.get("trip.route_id") in (None, ""),
+            str(b.row.get("trip.route_id") or ""),
+            str(b.row.get("trip.trip_id") or ""),
+            b.key,
+        ))
+        return rows
 
     # ---- which pattern/direction is the bus on? ----
     def assignment(self, b):
@@ -620,6 +630,8 @@ class App:
         self.stop = None               # selected stop id
         self.route = None              # route filter (route_id)
         self.board_i = 0
+        self.unres_i = 0               # selected row in unresolved buses view
+        self.unres_key = None          # plate of the highlighted unresolved bus (the highlight follows the bus, not the row number)
         self.scroll = 0
         self.search = {"kind": "stop", "q": "", "res": [], "i": 0}
         self.quit = False
@@ -677,6 +689,10 @@ class App:
                 self.mode = "map"; self.scroll = 0
             elif k == ord("g") and self.mode == "raw":
                 self.open_here()
+            elif k == ord("u") and self.mode == "fields":
+                self.unres_i = 0; self.unres_key = None; self.scroll = 0; self.mode = "unresolved"
+            elif k == ord("f") and self.mode == "fields":
+                self.force.set()
             elif k in (curses.KEY_DOWN, ord("j")):
                 self.scroll += 1
             elif k in (curses.KEY_UP, ord("k")):
@@ -685,6 +701,31 @@ class App:
                 self.scroll += 10
             elif k == curses.KEY_PPAGE:
                 self.scroll = max(0, self.scroll - 10)
+            return
+        if self.mode == "unresolved":
+            rows = self.fleet.unresolved_buses()
+            self.unres_sync(rows)
+            if k in (27, ord("i")):
+                self.mode = "fields"; self.scroll = 0
+            elif k == ord("q"):
+                self.mode = "map"; self.scroll = 0
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.unres_i = min(self.unres_i + 1, max(0, len(rows) - 1))
+            elif k in (curses.KEY_UP, ord("k")):
+                self.unres_i = max(0, self.unres_i - 1)
+            elif k == curses.KEY_NPAGE:
+                self.unres_i = min(self.unres_i + 10, max(0, len(rows) - 1))
+            elif k == curses.KEY_PPAGE:
+                self.unres_i = max(0, self.unres_i - 10)
+            elif k in (ord("\n"), curses.KEY_ENTER) and rows:
+                b = rows[min(self.unres_i, len(rows) - 1)]
+                self.select_bus(b.key)
+            elif k == ord("g"):
+                self.open_here()
+            elif k == ord("f"):
+                self.force.set()
+            if rows:                                   # remember the bus the cursor is on now
+                self.unres_i = max(0, min(self.unres_i, len(rows) - 1)); self.unres_key = rows[self.unres_i].key
             return
         if self.mode == "board":
             rows = self.fleet.stop_board(self.stop)
@@ -760,10 +801,25 @@ class App:
                 return True
         return False
 
+    def unres_sync(self, rows):
+        """Keep the highlight on the same bus when the live list changes (a bus above it appears or disappears)."""
+        keys = [b.key for b in rows]
+        if self.unres_key in keys:
+            self.unres_i = keys.index(self.unres_key)
+        self.unres_i = max(0, min(self.unres_i, len(rows) - 1)) if rows else 0
+        self.unres_key = rows[self.unres_i].key if rows else None
+
     def open_here(self):
         """g key: Google Maps for the stop board's stop, else the selected bus, else the map centre."""
         if self.mode == "board" and self.stop:
             _, la, lo = self.static.stops[self.stop]
+        elif self.mode == "unresolved":
+            rows = self.fleet.unresolved_buses()
+            if not rows:
+                return
+            self.unres_sync(rows)
+            b = rows[self.unres_i]
+            la, lo = b.lat, b.lon
         elif self.sel in self.fleet.buses:
             la, lo = self.fleet.buses[self.sel].lat, self.fleet.buses[self.sel].lon
         else:
@@ -858,6 +914,7 @@ class App:
         elif self.mode == "board": self.draw_board(scr, H, W)
         elif self.mode == "raw": self.draw_raw(scr, H, W)
         elif self.mode == "fields": self.draw_fields(scr, H, W)
+        elif self.mode == "unresolved": self.draw_unresolved(scr, H, W)
         elif self.mode == "help": self.draw_help(scr, H, W)
         else: self.draw_map(scr, H, W, mh)
         scr.refresh()
@@ -1008,6 +1065,65 @@ class App:
         scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
         self.footer(scr, H, "Up/Down choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
 
+    def draw_unresolved(self, scr, H, W):
+        self.header(scr, W, " | UNRESOLVED BUSES")
+        rows = self.fleet.unresolved_buses()
+        n_total = len(rows)
+        with_rid = [b for b in rows if b.row.get("trip.route_id") not in (None, "")]
+        no_rid = n_total - len(with_rid)
+        head = f"Unresolved buses: {n_total}   (unmatched route_id: {len(with_rid)}, missing route_id: {no_rid})"
+        scr.put(2, 1, head, "bold")
+        self.unres_sync(rows)
+        if rows:
+            sel_b = rows[self.unres_i]
+            scr.link(2, len(head) + 4, "[open in Google Maps]", maps_url(sel_b.lat, sel_b.lon))
+        rcnt = Counter(str(b.row.get("trip.route_id")).strip() for b in with_rid)
+        if rcnt:
+            top_r = "  ".join(f"{k}({v})" for k, v in rcnt.most_common(18))
+            scr.put(3, 1, f"Unmatched route_ids in feed ({len(rcnt)} distinct): {top_r}", "dim")
+        else:
+            scr.put(3, 1, "No unmatched route_id strings in the current snapshot.", "dim")
+        has_real = self.fleet.source_name != "otd"
+        scr.put(4, 1, "Live list of buses whose route_id and trip_id are not in your static GTFS routes.txt / trips.txt. Speeds in km/h.", "dim")
+        VW, RW, TW, SW, CW, PW = 14, 14, 24, 11, 12, 21
+        scr.put(5, 1, f"{'VEHICLE':<{VW}}{'RAW ROUTE_ID':<{RW}}{'RAW TRIP_ID':<{TW}}{'START':<{SW}}{'SCHEDULE':<{CW}}{'POSITION':<{PW}}"
+                      + (f"{'REAL':>7}" if has_real else "") + f"{'CALC':>7}{'AGE':>8}", "rev")
+        if not rows:
+            scr.put(7, 1, "All buses in the feed are currently resolved to static GTFS routes!", "ok")
+        else:
+            vis_h = max(1, H - 9)
+            if self.unres_i < self.scroll:
+                self.scroll = self.unres_i
+            elif self.unres_i >= self.scroll + vis_h:
+                self.scroll = self.unres_i - vis_h + 1
+            self.scroll = max(0, min(self.scroll, max(0, n_total - vis_h)))
+            f1 = lambda x: "-" if x is None else f"{x:.0f}"
+            for i, b in enumerate(rows[self.scroll: self.scroll + vis_h]):
+                idx = self.scroll + i
+                raw_rid = str(b.row.get("trip.route_id") or "-").strip() or "-"
+                raw_tid = str(b.row.get("trip.trip_id") or "-").strip() or "-"
+                st_time = str(b.row.get("trip.start_time") or "-").strip() or "-"
+                sched = str(b.row.get("trip.schedule_relationship") or "-").strip() or "-"
+                pos = f"{b.lat:.5f},{b.lon:.5f}"
+                real_kmh = self.fleet._kmh(self.fleet.speed_real(b))
+                calc_kmh = self.fleet._kmh(self.fleet.speed_calc(b))
+                age_s = self.age(b)
+                line = (f"{b.key[:VW - 1]:<{VW}}{raw_rid[:RW - 1]:<{RW}}{raw_tid[:TW - 1]:<{TW}}"
+                        f"{st_time[:SW - 1]:<{SW}}{sched[:CW - 1]:<{CW}}{pos:<{PW}}"
+                        + (f"{f1(real_kmh):>7}" if has_real else "")
+                        + f"{f1(calc_kmh):>7}{f'{age_s:.0f}s':>8}")
+                if idx == self.unres_i:
+                    style = "rev"
+                elif age_s > STALE_S:
+                    style = "dim"
+                elif raw_rid != "-":
+                    style = self.style_for(raw_rid)
+                else:
+                    style = "warn"
+                scr.put(6 + i, 1, line, style)
+            scr.put(H - 3, 1, f"Showing {self.scroll + 1}-{min(n_total, self.scroll + vis_h)} of {n_total} unresolved buses (updates live). Press Enter to locate the selected bus on the map.", "dim")
+        self.footer(scr, H, "Up/Down/PgUp/PgDn choose bus | Enter locate on map | g Google Maps | f refresh | i/Esc back to fields | q map")
+
     def draw_search(self, scr, H, W):
         s = self.search
         self.header(scr, W, " | SEARCH")
@@ -1073,11 +1189,13 @@ class App:
         trip_ok = sum(1 for b in with_trip if str(b.row["trip.trip_id"]) in self.static.trip_info)
         with_route = [b for b in buses if b.row.get("trip.route_id") not in (None, "")]
         route_ok = sum(1 for b in with_route if b.route_ok)
+        resolved = sum(1 for b in buses if b.route_id)
+        unresolved = len(buses) - resolved
         stale = sum(1 for b in buses if self.age(b) > STALE_S)
         lines = [(f"vehicles in latest snapshot: {len(self.fleet.rows)}   usable (valid position): {len(buses)}   stale (> {STALE_S}s): {stale}", "bold"),
                  (f"trip_id present: {len(with_trip)}  found in static trips.txt: {trip_ok} ({100 * trip_ok / max(1, len(with_trip)):.0f}%)", "warn" if with_trip and trip_ok / len(with_trip) < .5 else "n"),
                  (f"route_id present: {len(with_route)}  matched to static routes: {route_ok} ({100 * route_ok / max(1, len(with_route)):.0f}%)", "n"),
-                 (f"buses resolved to a route (by either ID): {sum(1 for b in buses if b.route_id)} of {len(buses)}", "n"), ("", "n"),
+                 (f"buses resolved to a route (by either ID): {resolved} of {len(buses)}   (unresolved: {unresolved} -> press 'u' for live table)", "warn" if unresolved else "n"), ("", "n"),
                  (f"{'FIELD':<34}{'PRESENT':>9}{'ZERO':>8}   EXAMPLE", "rev")]
         for k in sorted(present):
             z = f"{100 * zero[k] / num[k]:.0f}%" if num[k] else "-"
@@ -1085,7 +1203,7 @@ class App:
         self.scroll = min(self.scroll, max(0, len(lines) - (H - 3)))
         for i, (t, st) in enumerate(lines[self.scroll: self.scroll + H - 3]):
             scr.put(2 + i, 1, t, st)
-        self.footer(scr, H, "Up/Down scroll | Esc back   (these numbers answer: do trip IDs match? is speed all zero?)")
+        self.footer(scr, H, f"Up/Down scroll | u unresolved buses ({unresolved}) | f refresh | Esc back   (do trip IDs match? is speed all zero?)")
 
     def draw_help(self, scr, H, W):
         self.header(scr, W, " | HELP")
@@ -1094,7 +1212,7 @@ class App:
                "  s   stop board of the stop nearest the centre             S  board for the selected bus's next stop",
                "  /   search a stop by name/id      r   show only one route (also draws its line and stops)     x  clear",
                "  v   find a bus by its number plate: type the whole plate or only the last digits (for example 5635); Enter selects it",
-               "  i   what fields does the feed fill, do IDs match      f  refresh now      q  quit",
+               "  i   what fields does the feed fill, do IDs match (press u inside 'i' to list unresolved buses)   f  refresh now   q  quit",
                "  g   open the selected bus / stop / map centre in Google Maps (default browser). Or click the underlined [open in Google Maps].", "",
                "BUBBLES  (534) = bus on route 534.  o = bus whose label did not fit.  At far zoom: * one bus, 2..9 / # = many buses.",
                "         [534] highlighted = selected bus.   + in the middle = map centre.   . = bus stop (zoom in to see)", "",

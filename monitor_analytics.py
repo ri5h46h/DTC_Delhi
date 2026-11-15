@@ -43,7 +43,9 @@ BUNCH_FRAC = 0.25     # bunched = headway below this share of the normal headway
 GAP_FACTOR = 2.0      # long gap = headway above this multiple of the normal headway
 SLOW_RATIO = 1.6      # slow window = median (time / usual time) at or above this
 MIN_OBS_WINDOW = 15   # a 15-minute window needs at least this many observations
-STALL_MIN_S, STALL_FACTOR = 300, 6.0
+STALL_MIN_S, STALL_FACTOR, STALL_MAX_S = 300, 6.0, 7200
+FULL_HOUR_SHARE = 0.5   # an hour with fewer arrivals than this share of the busiest hour of that day counts as partly covered
+MIN_SECTION_M = 150   # shorter sections are not ranked by speed (timing is too coarse)
 MAX_SEG_KMH = 80      # faster stop-to-stop speeds are treated as errors
 WANT = {"run_id", "route_id", "vehicle_id", "stop_idx", "stop_id", "arrive_ts", "quality", "stop_prog_m"}
 
@@ -99,6 +101,10 @@ def load_arrivals(folder, date, keep_coarse):
     a["day"] = (local // 86400).astype(int)
     a["hour"] = ((local % 86400) // 3600).astype(int)
     a["bin15"] = ((local % 86400) // 900).astype(int)
+    hc = a.groupby(["day", "hour"]).size().rename("hc")             # hours at the start / end of a session are only partly covered
+    a = a.join(hc, on=["day", "hour"])
+    a["full_hour"] = a["hc"] >= FULL_HOUR_SHARE * a.groupby("day")["hc"].transform("max")
+    a = a.drop(columns="hc")
     a = a.sort_values(["route_id", "vehicle_id", "stop_idx", "arrive_ts"])
     same = (a["route_id"] == a["route_id"].shift()) & (a["vehicle_id"] == a["vehicle_id"].shift()) & (a["stop_idx"] == a["stop_idx"].shift())
     dup = same & ((a["arrive_ts"] - a["arrive_ts"].shift()).abs() < 120)       # the same bus, same stop, twice (overlapping runs)
@@ -110,8 +116,8 @@ def load_arrivals(folder, date, keep_coarse):
 def headways(a):
     h = a.sort_values(["day", "route_id", "stop_idx", "arrive_ts"])
     key = (h["day"] == h["day"].shift()) & (h["route_id"] == h["route_id"].shift()) & (h["stop_idx"] == h["stop_idx"].shift()) & (h["vehicle_id"] != h["vehicle_id"].shift())
-    h = h.assign(headway_s=(h["arrive_ts"] - h["arrive_ts"].shift()).where(key))
-    h = h[h["headway_s"].between(MIN_H_S, MAX_H_S)].copy()
+    h = h.assign(headway_s=(h["arrive_ts"] - h["arrive_ts"].shift()).where(key), prev_veh=h["vehicle_id"].shift())
+    h = h[h["headway_s"].between(MIN_H_S, MAX_H_S) & h["full_hour"]].copy()      # partly covered hours are dropped: they only show short headways
     g = ["day", "route_id", "hour"]
     n_ref = h.groupby(g)["headway_s"].transform("size"); ref = h.groupby(g)["headway_s"].transform("median")
     n2 = h.groupby(["day", "route_id"])["headway_s"].transform("size"); ref2 = h.groupby(["day", "route_id"])["headway_s"].transform("median")
@@ -120,25 +126,29 @@ def headways(a):
     h["bunched"] = (h["headway_s"] < BUNCH_FRAC * h["ref_s"]) & ok
     h["gap"] = (h["headway_s"] > GAP_FACTOR * h["ref_s"]) & ok
     h["h2"] = h["headway_s"] ** 2
+    h["norm"] = h["headway_s"] / h["ref_s"]
+    h["pair"] = h["day"].astype(str) + "|" + h["vehicle_id"] + "|" + h["prev_veh"]
     return h
 
 
 def route_headway_table(h, a):
     g = h.groupby("route_id").agg(headways=("headway_s", "size"), mean_s=("headway_s", "mean"), median_s=("headway_s", "median"),
                                    sd_s=("headway_s", "std"), sum_h=("headway_s", "sum"), sum_h2=("h2", "sum"),
+                                   norm_mean=("norm", "mean"), norm_sd=("norm", "std"), bus_pairs=("pair", "nunique"),
                                    pct_bunched=("bunched", "mean"), pct_long_gap=("gap", "mean"))
-    g["cv"] = g["sd_s"] / g["mean_s"]
+    g["cv"] = g["norm_sd"] / g["norm_mean"]          # spread of (headway / normal headway of that hour): 0 = even, about 1 = random arrivals
     g["avg_wait_min"] = g["sum_h2"] / (2 * g["sum_h"]) / 60            # what a passenger arriving at random waits on average
     g["even_wait_min"] = g["mean_s"] / 2 / 60                          # the wait if buses were perfectly evenly spaced
     g["excess_wait_min"] = g["avg_wait_min"] - g["even_wait_min"]
     g["median_headway_min"] = g["median_s"] / 60
     g["buses"] = a.groupby("route_id")["vehicle_id"].nunique().reindex(g.index)
     g["pct_bunched"] *= 100; g["pct_long_gap"] *= 100
-    return g.drop(columns=["sum_h", "sum_h2", "sd_s", "mean_s", "median_s"]).reset_index()
+    return g.drop(columns=["sum_h", "sum_h2", "sd_s", "mean_s", "median_s", "norm_mean", "norm_sd"]).reset_index()
 
 
 # ============================ segments (stop to stop) ============================
 def segments(a):
+    """returns (stop-to-stop table, time-of-day factors)"""
     s = a.sort_values(["run_key", "stop_idx"]).reset_index(drop=True)
     ok = (s["run_key"] == s["run_key"].shift()) & ((s["stop_idx"] - s["stop_idx"].shift()) == 1)
     s["seg_s"] = (s["arrive_ts"] - s["arrive_ts"].shift()).where(ok)
@@ -155,22 +165,31 @@ def segments(a):
     s = s.merge(bh, on=["route_id", "stop_idx", "hour"], how="left").merge(b0, on=["route_id", "stop_idx"], how="left")
     s["base_s"] = np.where(s["n_h"] >= 10, s["base_h"], np.where(s["n_0"] >= 10, s["base_0"], np.nan))
     s["ratio"] = np.where(s["base_s"] >= 5, s["seg_s"] / s["base_s"], np.nan)
-    return s.drop(columns=["base_h", "n_h", "base_0", "n_0"])
+    s["weekend"] = ((s["day"] + 3) % 7 >= 5)
+    # Most sections have fewer than 10 cases per hour, so the usual time is mostly an all-day value and rush hours look slow.
+    # The time-of-day factor (median ratio of everything in that hour) is divided out, so only the surprise remains.
+    fac = s.groupby(["weekend", "hour"]).agg(hour_factor=("ratio", "median"), factor_days=("day", "nunique")).reset_index()
+    s = s.merge(fac, on=["weekend", "hour"], how="left")
+    s["ratio_adj"] = s["ratio"] / s["hour_factor"]
+    mx = a.groupby("route_id")["stop_idx"].max()
+    s["near_end"] = (s["stop_idx"] <= 2) | (s["stop_idx"] >= s["route_id"].map(mx) - 2)     # first or last sections: terminal halts are normal there
+    return s.drop(columns=["base_h", "n_h", "base_0", "n_0"]), fac
 
 
 def slow_windows(s):
-    v = s[s["ratio"].notna()]
-    w = v.groupby(["day", "bin15", "route_id"])["ratio"].agg(ratio_median="median", observations="size").reset_index()
+    v = s[s["ratio_adj"].notna() & ~s["near_end"]]
+    w = v.groupby(["day", "bin15", "route_id"])["ratio_adj"].agg(ratio_median="median", observations="size").reset_index()
     w = w[(w["observations"] >= MIN_OBS_WINDOW) & (w["ratio_median"] >= SLOW_RATIO)].sort_values("ratio_median", ascending=False)
-    c = v.groupby(["day", "bin15"])["ratio"].agg(ratio_median="median", observations="size").reset_index()
+    c = v.groupby(["day", "bin15"]).agg(ratio_median=("ratio_adj", "median"), observations=("ratio_adj", "size"), factor_days=("factor_days", "first")).reset_index()
     return w, c[c["observations"] >= 200]
 
 
 def stalls(s):
-    t = s[s["base_s"].notna() & (s["seg_s"] > np.maximum(STALL_MIN_S, STALL_FACTOR * s["base_s"])) & (s["seg_s"] < 3600)].copy()
+    t = s[s["base_s"].notna() & (s["seg_s"] > np.maximum(STALL_MIN_S, STALL_FACTOR * s["base_s"])) & (s["seg_s"] < STALL_MAX_S)].copy()
+    t["kind"] = np.where(t["near_end"], "terminal", "on route")
     t["time_ist"] = pd.to_datetime(t["arrive_ts"] + IST, unit="s").dt.strftime("%Y-%m-%d %H:%M:%S")
     t["took_min"] = (t["seg_s"] / 60).round(1); t["usual_min"] = (t["base_s"] / 60).round(1)
-    return t.sort_values("seg_s", ascending=False)[["time_ist", "route_id", "vehicle_id", "prev_stop_id", "stop_id", "took_min", "usual_min"]]
+    return t.sort_values("seg_s", ascending=False)[["time_ist", "kind", "route_id", "vehicle_id", "prev_stop_id", "stop_id", "took_min", "usual_min"]]
 
 
 def reliability(s):
@@ -195,25 +214,34 @@ def run_all(a, files, n0, out, names, stops, plots, min_h, top):
     print("days: " + ", ".join(dayname(d) for d in days))
 
     # ---- 1-3
-    say(1, 6, "HEADWAYS, BUNCHING AND WAIT TIME", f"Time between two buses of one route_id at one stop (different buses, {MIN_H_S} s to {MAX_H_S // 60} min). Normal headway = median of that route_id, day and hour.")
+    say(1, 6, "HEADWAYS, BUNCHING AND WAIT TIME", f"Time between two buses of one route_id at one stop (different buses, {MIN_H_S} s to {MAX_H_S // 60:.0f} min). Normal headway = median of that route_id, day and hour. Partly covered hours (session start / end) are left out.")
     h = headways(a)
     rt = route_headway_table(h, a); rt.to_csv(out / "route_headway.csv", index=False)
     print(f"      {len(h):,} headways on {h['route_id'].nunique():,} route_ids. All routes together: median headway {h['headway_s'].median() / 60:.1f} min, "
           f"bunched {100 * h['bunched'].mean():.1f}%, long gaps {100 * h['gap'].mean():.1f}%")
-    big = rt[rt["headways"] >= min_h].copy()
-    print(f"      {len(big):,} route_ids have at least {min_h} headways and are ranked below.")
-    cols = lambda d: [(lab(r.route_id), int(r.headways), f"{r.median_headway_min:.1f}", f"{r.cv:.2f}", f"{r.pct_bunched:.1f}", f"{r.pct_long_gap:.1f}", f"{r.excess_wait_min:.1f}") for r in d.itertuples()]
-    head = f"      {'route':<22}{'headways':>9}{'median min':>11}{'CV':>6}{'bunched%':>9}{'gaps%':>7}{'extra wait min':>15}"
-    print("\n      Most excess waiting time (buses very unevenly spaced):")
+    print("      BENCHMARK: buses that arrive completely at random (no control at all) would give bunched about 16%, long gaps about 25%, CV 1.0.")
+    print("      A perfectly regular service gives 0%, 0% and CV 0. So compare each route with these two ends, not with zero.")
+    big = rt[rt["bus_pairs"] >= min_h].copy()
+    print(f"      {len(big):,} route_ids have at least {min_h} different bus pairs (the same two buses seen at many stops count once) and are ranked below.")
+    if len(big):
+        bands = pd.cut(big["cv"], [-1, 0.5, 0.8, 1.2, 99], labels=["regular (CV under 0.5)", "somewhat regular (0.5-0.8)", "random-like (0.8-1.2)", "clustered (over 1.2)"]).value_counts().reindex(
+            ["regular (CV under 0.5)", "somewhat regular (0.5-0.8)", "random-like (0.8-1.2)", "clustered (over 1.2)"])
+        print("      Ranked routes by spacing: " + " | ".join(f"{k} {v} ({100 * v / len(big):.0f}%)" for k, v in bands.items()))
+    cols = lambda d: [(lab(r.route_id), int(r.bus_pairs), f"{r.median_headway_min:.1f}", f"{r.cv:.2f}", f"{r.pct_bunched:.1f}", f"{r.pct_long_gap:.1f}", f"{r.excess_wait_min:.1f}") for r in d.itertuples()]
+    head = f"      {'route':<30}{'bus pairs':>10}{'median min':>11}{'CV':>6}{'bunched%':>9}{'gaps%':>7}{'extra wait min':>15}"
+    print("\n      Most clustered / uneven buses (highest CV, a scale-free measure):")
     print(head)
-    for row in cols(big.sort_values("excess_wait_min", ascending=False).head(top)):
-        print(f"      {row[0]:<22}{row[1]:>9}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
+    for row in cols(big.sort_values("cv", ascending=False).head(top)):
+        print(f"      {row[0]:<30}{row[1]:>10}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
     print("\n      Most bunching:")
     print(head)
     for row in cols(big.sort_values("pct_bunched", ascending=False).head(top)):
-        print(f"      {row[0]:<22}{row[1]:>9}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
-    print("      (CV = spread of headways / average headway: 0 = perfectly even, around 1 = random, above 1 = buses come in groups. "
-          "Extra wait = minutes a passenger waits on average more than with perfectly even buses.)")
+        print(f"      {row[0]:<30}{row[1]:>10}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
+    print("\n      Most regular routes (lowest CV):")
+    print(head)
+    for row in cols(big.sort_values("cv").head(5)):
+        print(f"      {row[0]:<30}{row[1]:>10}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
+    print("      (Extra wait = minutes a passenger waits on average more than with perfectly even buses. It grows with the headway, so rank by CV.)")
     hb = h.groupby("hour").agg(headways=("headway_s", "size"), bunched=("bunched", "mean"), gap=("gap", "mean"))
     hb = hb[hb["headways"] >= 500]
     if len(hb):
@@ -222,38 +250,58 @@ def run_all(a, files, n0, out, names, stops, plots, min_h, top):
 
     # ---- segments
     say(2, 6, "STOP-TO-STOP TIMES", "For every bus and every pair of neighbouring stops that both got an arrival, the travel time and speed are calculated.")
-    s = segments(a)
+    s, fac = segments(a)
     print(f"      {len(s):,} stop-to-stop trips on {s['route_id'].nunique():,} route_ids | median speed {s['kmh'].median():.1f} km/h")
-    rel, q = reliability(s); rel.to_csv(out / "route_reliability.csv", index=False)
+    rel, q = reliability(s[~s["near_end"]]); rel.to_csv(out / "route_reliability.csv", index=False)
+    fac.to_csv(out / "time_of_day_factor.csv", index=False)
+    for wk, nm in ((False, "weekday"), (True, "weekend")):
+        t = fac[fac["weekend"] == wk]
+        if len(t):
+            print(f"      Time-of-day effect, time / all-day usual time ({nm}): " + " | ".join(f"{r.hour:02d}h {r.hour_factor:.2f}" for r in t.itertuples()))
+    print("      (above 1 = slower than the all-day usual: this is the normal rush-hour pattern, so it is divided out before looking for slow windows)")
 
     # ---- 4 slow windows
-    say(3, 6, "SLOW WINDOWS", f"15-minute windows where the median (time / usual time) is at least {SLOW_RATIO} for a route_id (min {MIN_OBS_WINDOW} observations), or for the whole city.")
+    say(3, 6, "SLOW WINDOWS", f"15-minute windows where a route_id is at least {SLOW_RATIO}x slower than its usual time for that hour (min {MIN_OBS_WINDOW} observations; first and last sections left out). City-wide windows are judged only for hours that have 3+ days of data.")
     w, city = slow_windows(s)
     w["time_ist"] = [f"{dayname(d)[:10]} {hhmm(b)}" for d, b in zip(w["day"], w["bin15"])]
     w.to_csv(out / "slow_windows.csv", index=False); city.to_csv(out / "city_ratio_by_15min.csv", index=False)
     if len(w):
         print(f"      {len(w):,} slow route windows. Worst:")
         for r in w.head(top).itertuples():
-            print(f"      {r.time_ist}  {lab(r.route_id):<22} {r.ratio_median:.2f}x usual time ({r.observations} observations)")
+            print(f"      {r.time_ist}  {lab(r.route_id):<28} {r.ratio_median:.2f}x usual time ({r.observations} observations)")
+        cl = w.groupby(["day", "bin15"]).size().reset_index(name="routes").sort_values("routes", ascending=False)
+        cl = cl[cl["routes"] >= 5]
+        if len(cl):
+            print("      Times when 5 or more routes were slow together (a shared cause such as rain, an event or a closed road is possible): " + ", ".join(f"{dayname(r.day)[:10]} {hhmm(r.bin15)} ({r.routes} routes)" for r in cl.head(8).itertuples()))
     else:
         print("      no slow route windows found.")
-    cs = city[city["ratio_median"] >= 1.25]
+    cc = city[city["factor_days"] >= 3]
+    cs = cc[cc["ratio_median"] >= 1.15]
     if len(cs):
-        print("      City-wide slow windows (median time at least 1.25x usual): " + ", ".join(f"{dayname(r.day)[:10]} {hhmm(r.bin15)} ({r.ratio_median:.2f}x)" for r in cs.head(8).itertuples()))
-    elif len(city):
-        print(f"      City-wide: no window above 1.25x usual (highest {city['ratio_median'].max():.2f}x at {hhmm(city.loc[city['ratio_median'].idxmax(), 'bin15'])}).")
+        print("      City-wide slow windows (median at least 1.15x the usual for that hour): " + ", ".join(f"{dayname(r.day)[:10]} {hhmm(r.bin15)} ({r.ratio_median:.2f}x)" for r in cs.head(8).itertuples()))
+    elif len(cc):
+        print(f"      City-wide: no window above 1.15x (highest {cc['ratio_median'].max():.2f}x at {dayname(cc.loc[cc['ratio_median'].idxmax(), 'day'])[:10]} {hhmm(cc.loc[cc['ratio_median'].idxmax(), 'bin15'])}).")
+    else:
+        print("      City-wide check needs hours with 3+ days of data: not available.")
 
     # ---- 5 stalls
-    say(4, 6, "STALLS", f"A bus needed more than {STALL_MIN_S // 60} minutes and more than {STALL_FACTOR:.0f}x the usual time between two neighbouring stops.")
+    say(4, 6, "STALLS AND LONG HALTS", f"A bus needed more than {STALL_MIN_S // 60} minutes and more than {STALL_FACTOR:.0f}x the usual time between two neighbouring stops (up to {STALL_MAX_S // 3600} h). Pairs at the first / last 3 stops of a route are marked 'terminal'.")
     st = stalls(s); st.to_csv(out / "stalls.csv", index=False)
-    print(f"      {len(st):,} stalls found ({100 * len(st) / max(len(s), 1):.3f}% of stop-to-stop trips). Longest:")
-    for r in st.head(top).itertuples():
-        print(f"      {r.time_ist}  {lab(r.route_id):<22} bus {r.vehicle_id}  {stn(r.prev_stop_id)[:24]} -> {stn(r.stop_id)[:24]}: {r.took_min} min (usual {r.usual_min})")
-    if len(st):
-        print("      (a stall can be a breakdown, a jam, a long halt or a ping problem: look at the bus with the tracker before calling it a fault)")
+    on = st[st["kind"] == "on route"]
+    print(f"      {len(st):,} long halts ({100 * len(st) / max(len(s), 1):.3f}% of stop-to-stop trips): {len(st) - len(on):,} at terminals, {len(on):,} on the route.")
+    if len(on):
+        bd = pd.cut(on["took_min"], [0, 10, 20, 30, 60, 1e9], labels=["5-10 min", "10-20", "20-30", "30-60", "over 60"]).value_counts().reindex(["5-10 min", "10-20", "20-30", "30-60", "over 60"])
+        print("      On the route, by duration: " + " | ".join(f"{k} {v:,}" for k, v in bd.items()))
+        print("      Longest 5-30 minute halts on the route (long ones are mostly parked buses and driver breaks, not faults):")
+        mid = on[(on["took_min"] <= 30)]
+        for r in mid.head(top).itertuples():
+            print(f"      {r.time_ist}  {lab(r.route_id):<28} bus {r.vehicle_id}  {stn(r.prev_stop_id)[:24]} -> {stn(r.stop_id)[:24]}: {r.took_min} min (usual {r.usual_min})")
+        pr = on.groupby("route_id").size().sort_values(ascending=False).head(5)
+        print("      Routes with most halts on the route: " + ", ".join(f"{lab(r)} ({n})" for r, n in pr.items()))
+    print("      (a halt can be a breakdown, a jam, a driver break, a parked bus or a ping problem: check the bus with the tracker before calling it a fault)")
 
     # ---- 6 analytics
-    say(5, 6, "ROUTE RELIABILITY, SPEED BY HOUR, SLOWEST SECTIONS", "Buffer index = (slowest 10% time - median time) / median time for a stop pair; the route value is the median over its stop pairs. Higher = less predictable.")
+    say(5, 6, "ROUTE RELIABILITY, SPEED BY HOUR, SLOWEST SECTIONS", "Buffer index = (slowest 10% time - median time) / median time for a stop pair; the route value is the median over its stop pairs (first and last 3 stops left out). Higher = less predictable.")
     rb = rel[rel["sections"] >= 10]
     print(f"      {len(rb):,} route_ids with at least 10 stop pairs of 15+ observations. Median buffer index {rb['buffer_index'].median():.2f}, median route speed {rb['median_speed_kmh'].median():.1f} km/h")
     print("      Least predictable routes:")
@@ -269,11 +317,11 @@ def run_all(a, files, n0, out, names, stops, plots, min_h, top):
         t = sp[sp["weekend"] == wk]
         if len(t):
             print(f"      Median stop-to-stop speed by hour ({nm}): " + " | ".join(f"{r.hour:02d}h {r.median_kmh:.1f}" for r in t.itertuples()))
-    sec = s[s["kmh"].notna()].groupby(["route_id", "stop_idx"]).agg(median_kmh=("kmh", "median"), observations=("kmh", "size"), stop_id=("stop_id", "first"), prev_stop_id=("prev_stop_id", "first")).reset_index()
+    sec = s[s["kmh"].notna() & ~s["near_end"] & (s["seg_m"] >= MIN_SECTION_M)].groupby(["route_id", "stop_idx"]).agg(median_kmh=("kmh", "median"), observations=("kmh", "size"), stop_id=("stop_id", "first"), prev_stop_id=("prev_stop_id", "first")).reset_index()
     sec = sec[sec["observations"] >= 30].sort_values("median_kmh")
     sec["from_stop"] = sec["prev_stop_id"].map(stn); sec["to_stop"] = sec["stop_id"].map(stn)
     sec.to_csv(out / "slowest_sections.csv", index=False)
-    print("      Slowest sections (stop pair, 30+ observations):")
+    print(f"      Slowest sections (stop pair, 30+ observations, at least {MIN_SECTION_M} m long, not at the route ends):")
     for r in sec.head(top).itertuples():
         print(f"      {r.median_kmh:5.1f} km/h  {lab(r.route_id):<20} {str(r.from_stop)[:26]} -> {str(r.to_stop)[:26]}  ({r.observations})")
 
@@ -301,7 +349,7 @@ def make_plots(out, rt, city, sp, min_h):
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     except Exception:
         print("matplotlib is not installed: no charts (uv add matplotlib)"); return
-    big = rt[rt["headways"] >= min_h]
+    big = rt[rt["bus_pairs"] >= min_h]
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
     ax.scatter(big["median_headway_min"], big["excess_wait_min"], s=10, alpha=0.5)
     ax.set_xlabel("median headway (min)"); ax.set_ylabel("extra waiting time (min)"); ax.set_title("Extra waiting time per route_id")
@@ -354,6 +402,8 @@ def simulate(folder):
                         seg *= 2.0
                     if rid == "R_STALL" and di == 0 and j == 12 and idx == 15:
                         seg += 720; truth["stall_vehicle"] = veh
+                    if rid == "R_OTHER" and di == 0 and j == 5 and idx == 1:
+                        seg += 1200; truth["layover_vehicle"] = veh
                     if idx > 0:
                         t += seg
                     rows.append((run_id, rid, veh, idx, f"S{rid}_{idx}", round(t, 1), "good", idx * spacing))
@@ -369,7 +419,7 @@ def selftest():
         import io, contextlib
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            res = run_all(a, files, n0, tmp / "out", {}, {}, False, 100, 5)
+            res = run_all(a, files, n0, tmp / "out", {}, {}, False, 30, 5)
         print(buf.getvalue()[:0], end="")
         rt = res["rt"].set_index("route_id")
         checks = []
@@ -379,8 +429,9 @@ def selftest():
         checks.append(("R_EVEN excess wait below R_RANDOM", rt.loc["R_EVEN", "excess_wait_min"] < rt.loc["R_RANDOM", "excess_wait_min"]))
         checks.append(("R_BUNCH has more excess wait than R_EVEN", rt.loc["R_BUNCH", "excess_wait_min"] > rt.loc["R_EVEN", "excess_wait_min"] + 1))
         st = res["st"]
-        checks.append(("stall of 12 min found for the right bus", len(st) >= 1 and st.iloc[0]["vehicle_id"] == truth["stall_vehicle"] and st.iloc[0]["took_min"] > 11))
-        checks.append(("only that stall found", len(st) <= 2))
+        checks.append(("stall of 12 min found for the right bus", len(st) >= 1 and (st[st["kind"] == "on route"].iloc[0]["vehicle_id"] == truth["stall_vehicle"]) and st[st["kind"] == "on route"].iloc[0]["took_min"] > 11))
+        checks.append(("only that stall found on the route", (st["kind"] == "on route").sum() == 1))
+        checks.append(("20 min halt at stop 1 is marked terminal, not on route", ((st["kind"] == "terminal") & (st["vehicle_id"] == truth["layover_vehicle"])).any() and not ((st["kind"] == "on route") & (st["vehicle_id"] == truth["layover_vehicle"])).any()))
         w = res["w"]
         checks.append(("slow window found on R_SLOW", len(w) >= 1 and (w["route_id"] == "R_SLOW").any()))
         checks.append(("slow windows only on R_SLOW", set(w["route_id"]) <= {"R_SLOW"}))
@@ -401,7 +452,7 @@ def main():
     ap.add_argument("--data", default="data"); ap.add_argument("--gtfs", default="gtfs")
     ap.add_argument("--date"); ap.add_argument("--plots", action="store_true")
     ap.add_argument("--include-coarse", action="store_true", help="also use arrivals whose two pings were more than 90 s apart")
-    ap.add_argument("--min-headways", type=int, default=100, help="a route_id needs this many headways to be ranked")
+    ap.add_argument("--min-pairs", type=int, default=30, help="a route_id needs this many different bus pairs to be ranked")
     ap.add_argument("--top", type=int, default=10, help="rows shown in each list")
     ap.add_argument("--max-headway", type=float, default=MAX_H_S / 60, help="minutes; longer headways are dropped")
     a_ = ap.parse_args()
@@ -411,7 +462,7 @@ def main():
     t0 = time.time()
     names, stops = load_names(a_.gtfs)
     a, files, n0 = load_arrivals(Path(a_.data) / "arrivals", a_.date, a_.include_coarse)
-    run_all(a, files, n0, Path(a_.data) / "analytics", names, stops, a_.plots, a_.min_headways, a_.top)
+    run_all(a, files, n0, Path(a_.data) / "analytics", names, stops, a_.plots, a_.min_pairs, a_.top)
     print(f"done in {time.time() - t0:.0f} s")
 
 

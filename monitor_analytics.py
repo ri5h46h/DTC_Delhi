@@ -230,7 +230,7 @@ def run_all(a, files, n0, out, names, stops, plots, min_h, top):
         print("      Ranked routes by spacing: " + " | ".join(f"{k} {v} ({100 * v / len(big):.0f}%)" for k, v in bands.items()))
     cols = lambda d: [(lab(r.route_id), int(r.bus_pairs), f"{r.median_headway_min:.1f}", f"{r.cv:.2f}", f"{r.pct_bunched:.1f}", f"{r.pct_long_gap:.1f}", f"{r.excess_wait_min:.1f}") for r in d.itertuples()]
     head = f"      {'route':<30}{'bus pairs':>10}{'median min':>11}{'CV':>6}{'bunched%':>9}{'gaps%':>7}{'extra wait min':>15}"
-    print("\n      Most clustered / uneven buses (highest CV, a scale-free measure):")
+    print("\n      Least regular routes (highest CV; about 1.0 means random arrivals, above 1.2 means real clustering):")
     print(head)
     for row in cols(big.sort_values("cv", ascending=False).head(top)):
         print(f"      {row[0]:<30}{row[1]:>10}{row[2]:>11}{row[3]:>6}{row[4]:>9}{row[5]:>7}{row[6]:>15}")
@@ -365,15 +365,20 @@ def make_plots(out, rt, city, sp, min_h):
     fig.tight_layout(); fig.savefig(out / "plot_excess_wait.png", dpi=150); plt.close(fig)
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
     for wk, nm in ((False, "weekday"), (True, "weekend")):
-        t = sp[sp["weekend"] == wk]
+        t = sp[sp["weekend"] == wk].sort_values("hour")
         if len(t):
-            ax.plot(t["hour"], t["median_kmh"], marker="o", label=nm)
+            x = t["hour"].to_numpy(float); y = t["median_kmh"].to_numpy(float)
+            brk = np.where(np.diff(x) > 1)[0] + 1                              # hours with no data are shown as a gap
+            ax.plot(np.insert(x, brk, np.nan), np.insert(y, brk, np.nan), marker="o", label=nm)
     ax.set_xlabel("hour of day (IST)"); ax.set_ylabel("median stop-to-stop speed (km/h)"); ax.legend(); ax.set_title("Speed by hour")
     fig.tight_layout(); fig.savefig(out / "plot_speed_by_hour.png", dpi=150); plt.close(fig)
     if len(city):
         fig, ax = plt.subplots(figsize=(8, 4.2))
         for d, t in city.groupby("day"):
-            ax.plot(t["bin15"] * 0.25, t["ratio_median"], marker=".", label=dayname(d)[:10])
+            t = t.sort_values("bin15"); x = (t["bin15"] * 0.25).to_numpy(float); y = t["ratio_median"].to_numpy(float)
+            brk = np.where(np.diff(t["bin15"].to_numpy()) > 2)[0] + 1          # do not draw a line across a gap between two sessions
+            x, y = np.insert(x, brk, np.nan), np.insert(y, brk, np.nan)
+            ax.plot(x, y, marker=".", label=dayname(d)[:10])
         ax.axhline(1.0, color="grey", lw=0.8); ax.set_xlabel("hour of day (IST)"); ax.set_ylabel("time / usual time"); ax.legend(fontsize=7); ax.set_title("City-wide slowness (1.0 = usual)")
         fig.tight_layout(); fig.savefig(out / "plot_city_slowness.png", dpi=150); plt.close(fig)
     print(f"charts saved in {out}/ (plot_*.png)")

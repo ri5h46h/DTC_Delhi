@@ -118,16 +118,17 @@ def headways(a):
     key = (h["day"] == h["day"].shift()) & (h["route_id"] == h["route_id"].shift()) & (h["stop_idx"] == h["stop_idx"].shift()) & (h["vehicle_id"] != h["vehicle_id"].shift())
     h = h.assign(headway_s=(h["arrive_ts"] - h["arrive_ts"].shift()).where(key), prev_veh=h["vehicle_id"].shift())
     h = h[h["headway_s"].between(MIN_H_S, MAX_H_S) & h["full_hour"]].copy()      # partly covered hours are dropped: they only show short headways
+    h["pair"] = h["day"].astype(str) + "|" + h["vehicle_id"] + "|" + h["prev_veh"]
     g = ["day", "route_id", "hour"]
-    n_ref = h.groupby(g)["headway_s"].transform("size"); ref = h.groupby(g)["headway_s"].transform("median")
-    n2 = h.groupby(["day", "route_id"])["headway_s"].transform("size"); ref2 = h.groupby(["day", "route_id"])["headway_s"].transform("median")
+    # the normal headway needs 8 different bus pairs (the same pair seen at 30 stops is still one pair)
+    n_ref = h.groupby(g)["pair"].transform("nunique"); ref = h.groupby(g)["headway_s"].transform("median")
+    n2 = h.groupby(["day", "route_id"])["pair"].transform("nunique"); ref2 = h.groupby(["day", "route_id"])["headway_s"].transform("median")
     h["ref_s"] = np.where(n_ref >= 8, ref, np.where(n2 >= 8, ref2, np.nan))
     ok = h["ref_s"].notna()
     h["bunched"] = (h["headway_s"] < BUNCH_FRAC * h["ref_s"]) & ok
     h["gap"] = (h["headway_s"] > GAP_FACTOR * h["ref_s"]) & ok
     h["h2"] = h["headway_s"] ** 2
-    h["norm"] = h["headway_s"] / h["ref_s"]
-    h["pair"] = h["day"].astype(str) + "|" + h["vehicle_id"] + "|" + h["prev_veh"]
+    h["norm"] = (h["headway_s"] / h["ref_s"]).clip(upper=5)      # capped at 5x normal so one huge gap cannot decide the CV
     return h
 
 
@@ -321,6 +322,14 @@ def run_all(a, files, n0, out, names, stops, plots, min_h, top):
     sec = sec[sec["observations"] >= 30].sort_values("median_kmh")
     sec["from_stop"] = sec["prev_stop_id"].map(stn); sec["to_stop"] = sec["stop_id"].map(stn)
     sec.to_csv(out / "slowest_sections.csv", index=False)
+    hs = s[s["kmh"].notna() & ~s["near_end"] & (s["seg_m"] >= MIN_SECTION_M)].groupby(["prev_stop_id", "stop_id"]).agg(
+        median_kmh=("kmh", "median"), observations=("kmh", "size"), routes=("route_id", "nunique")).reset_index()
+    hs = hs[(hs["routes"] >= 3) & (hs["observations"] >= 100)].sort_values("median_kmh")
+    hs["from_stop"] = hs["prev_stop_id"].map(stn); hs["to_stop"] = hs["stop_id"].map(stn)
+    hs.to_csv(out / "congestion_hotspots.csv", index=False)
+    print(f"      CONGESTION HOTSPOTS: the same stop pair on 3+ different route_ids, 100+ observations ({len(hs):,} pairs qualify). More reliable than a single route because several routes agree:")
+    for r in hs.head(top).itertuples():
+        print(f"      {r.median_kmh:5.1f} km/h  {str(r.from_stop)[:30]} -> {str(r.to_stop)[:30]}  ({r.routes} routes, {r.observations} observations)")
     print(f"      Slowest sections (stop pair, 30+ observations, at least {MIN_SECTION_M} m long, not at the route ends):")
     for r in sec.head(top).itertuples():
         print(f"      {r.median_kmh:5.1f} km/h  {lab(r.route_id):<20} {str(r.from_stop)[:26]} -> {str(r.to_stop)[:26]}  ({r.observations})")

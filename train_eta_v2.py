@@ -15,6 +15,8 @@ What is new compared with train_eta.py
    python train_eta_v2.py                    final model: train 60% / validation 20% / test 20% in time, ranges, ablations
    python train_eta_v2.py --mode cv          leave-one-day-out test (slower)
    python train_eta_v2.py --step 10          use every 10th ping (faster)
+   python train_eta_v2.py --threads 4 --cool 20   cooler on a fanless laptop: 4 threads, 20 s pause after every model (slower, same kind of result)
+While it runs, one live status line (stage, loop progress, LightGBM tree number and validation loss) is shown on the screen; it is not part of the printed result.
 Keep train_eta.py in the same folder (this script uses its loading code). Needs lightgbm (uv add lightgbm), else scikit-learn is used.
 """
 import argparse, json, pickle
@@ -24,6 +26,7 @@ import pandas as pd
 
 try:
     from train_eta import load, ping_features, make_cases, metrics
+    from train_eta import RUN, Progress, note, live_clear, lgb_progress, cool_down, mark, print_times, add_run_args, setup_run
 except ImportError:
     raise SystemExit("Keep train_eta.py in the same folder as train_eta_v2.py.")
 
@@ -86,7 +89,10 @@ def hist_feats(cases, tables):
     for k, r in enumerate(cases["route_id"].values):
         pos.setdefault(r, []).append(k)
     p, si = cases["prog"].values, cases["sidx"].values
-    for r, rows in pos.items():
+    prog_ = Progress("history inputs per route", len(pos)) if len(cases) > 50000 else None
+    for n_r, (r, rows) in enumerate(pos.items()):
+        if prog_ and n_r % 50 == 0:
+            prog_.update(n_r)
         t = tables.get(r)
         if t is None:
             continue
@@ -98,6 +104,8 @@ def hist_feats(cases, tables):
         k2 = np.clip(np.searchsorted(prog, p[rows], side="right") - 1, 0, len(prog) - 2)
         dp[rows] = p[rows] - prog[k2]
         sf[rows] = dp[rows] / np.maximum(prog[k2 + 1] - prog[k2], 1)
+    if prog_:
+        prog_.done()
     return eta, dp, sf
 
 
@@ -117,12 +125,17 @@ def recent_feats(cases, ev):
     cpos = {}
     for k, r in enumerate(cases["route_id"].values):
         cpos.setdefault(r, []).append(k)
-    for r, rows in cpos.items():
+    prog_ = Progress("recent-buses inputs per route", len(cpos)) if len(cases) > 50000 else None
+    for n_r, (r, rows) in enumerate(cpos.items()):
+        if prog_ and n_r % 50 == 0:
+            prog_.update(n_r)
         e = eidx.get(r)
         if e is None:
             continue
         rows = np.array(rows)
         rr[rows], rrn[rows] = window_mean(ev["t_end"].values[e], ev["ratio"].values[e], ts[rows], 1200)
+    if prog_:
+        prog_.done()
     return rc, rcn, rr, rrn
 
 
@@ -132,10 +145,13 @@ class Learned:
 
 def learn(tr, arr_train, arr_all):
     L = Learned()
+    note("learning typical speeds and stop-to-stop times ...")
     vt = (tr["dist"] / tr["actual"]).clip(1, 20)
     L.v_global = float(vt.median()); L.v_route = vt.groupby(tr["route_id"]).median().to_dict()
     L.med = seg_medians(arr_train)
+    note("history tables per route ...")
     L.tables = route_tables(arr_all, L.med, L.v_global)
+    note("observed stop-to-stop times (for the recent-buses inputs) ...")
     L.events = make_events(arr_all, L.med)
     tmp = tr[["route_id", "sidx", "prog", "dist", "actual", "hour", "is_weekend"]].copy()
     tmp["hist_eta"] = hist_feats(tmp, L.tables)[0]
@@ -159,23 +175,28 @@ def add_feats(d, L):
 
 
 # ---------------------------------------------------------------- models
-def fit_model(Xtr, ytr, Xva, yva, backend, kind="l1", alpha=0.5, quiet=False):
+def fit_model(Xtr, ytr, Xva, yva, backend, kind="l1", alpha=0.5, quiet=False, label="model"):
     if backend == "lightgbm":
         import lightgbm as lgb
-        params = dict(learning_rate=0.08, num_leaves=127, min_data_in_leaf=200, feature_fraction=0.9, bagging_fraction=0.8, bagging_freq=1, verbose=-1, num_threads=0)
+        params = dict(learning_rate=0.08, num_leaves=127, min_data_in_leaf=200, feature_fraction=0.9, bagging_fraction=0.8, bagging_freq=1, verbose=-1, num_threads=RUN["threads"])
         params.update(objective="regression_l1") if kind == "l1" else params.update(objective="quantile", alpha=alpha)
         dtr = lgb.Dataset(Xtr, ytr); dva = lgb.Dataset(Xva, yva, reference=dtr)
-        m = lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva], callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)])
+        m = lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva], callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0), lgb_progress(label)])
+        live_clear()
         if not quiet:
             print(f"      trained {m.best_iteration} trees")
+        cool_down(label)
         return m, m.predict
     from sklearn.ensemble import HistGradientBoostingRegressor
     kw = dict(loss="absolute_error") if kind == "l1" else dict(loss="quantile", quantile=alpha)
     m = HistGradientBoostingRegressor(learning_rate=0.1, max_iter=300, max_leaf_nodes=63, min_samples_leaf=100, early_stopping=True,
                                       validation_fraction=0.1, n_iter_no_change=20, random_state=0, **kw)
+    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...")
     m.fit(Xtr, ytr)
+    live_clear()
     if not quiet:
         print(f"      trained {m.n_iter_} trees (scikit-learn)")
+    cool_down(label)
     return m, m.predict
 
 
@@ -200,11 +221,13 @@ def pick_backend(b):
 def prepare(a):
     pings, arr, files = load(a.arrivals, a.date)
     print(f"1. LOAD      {len(files)} day(s): {len(pings):,} pings, {len(arr):,} arrivals")
+    mark("1. load the day files")
     pings = ping_features(pings)
     cases = make_cases(pings, arr, a.step, a.hmax)
     cases = cases[cases["dist"] > 0].reset_index(drop=True)
     if len(cases) < 3000:
         raise SystemExit(f"Only {len(cases):,} cases. Collect and process more data (or use a smaller --step).")
+    mark("2. speeds and cases")
     return cases, arr
 
 # ---------------------------------------------------------------- final model: time split, ranges, ablations
@@ -215,8 +238,10 @@ def run_final(a, cases, arr, backend):
     L = learn(tr, arr[arr["arrive_ts"] < c1], arr)
     print(f"3. LEARN     typical speed {L.v_global * 3.6:.0f} km/h; {len(L.v_route):,} routes; stop-to-stop times of {len(L.tables):,} routes; {len(L.events):,} observed stop-to-stop times; "
           f"time-of-day factors for {len(L.tod)} hour groups")
+    mark("3. learn from the training days")
     sub = tr.sample(min(len(tr), a.max_train), random_state=0) if len(tr) > a.max_train else tr
     sub, va, te = add_feats(sub, L), add_feats(va, L), add_feats(te, L)
+    mark("   inputs for train / validation / test")
     ev = te.copy()
     ev["r_hist_tod"] = ev["base"]; ev["r_hist"] = ev["hist_eta"].fillna(ev["eta_route"]); ev["r_route"] = ev["eta_route"]
     ev["r_calc"] = ev["dist"] / (ev["v1"] / 3.6).clip(2, 14).fillna(L.v_global); ev["r_feed"] = ev["dist"] / ev["rep"].clip(2, 14).fillna(L.v_global)
@@ -224,10 +249,11 @@ def run_final(a, cases, arr, backend):
 
     def train(name, col, feats, kind="l1", alpha=0.5, store=None):
         print(f"4. TRAIN     {name} ...")
-        m, pr = fit_model(sub[feats].astype("float32"), to_target(sub, a.target), va[feats].astype("float32"), to_target(va, a.target), backend, kind, alpha)
+        m, pr = fit_model(sub[feats].astype("float32"), to_target(sub, a.target), va[feats].astype("float32"), to_target(va, a.target), backend, kind, alpha, label=name)
         ev[col] = from_pred(ev, pr(ev[feats].astype("float32")), a.target)
         if store:
             models[store] = (m, feats)
+        mark("4. train " + name)
         return m
     main = train("main model (all inputs)", "r_ai", FEATURES, store="point"); rules.append(("AI model v2 (all inputs)", "r_ai"))
     if not a.no_ablation:
@@ -268,8 +294,9 @@ def run_final(a, cases, arr, backend):
         lo_a, hi_a = a.low, a.high
         print(f"\nPREDICTION RANGES (a lower and an upper guess; the range should hold the real time about {100 * (hi_a - lo_a):.0f}% of the time)")
         residual_feats = FEATURES
-        mlo, plo = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", lo_a, quiet=True)
-        mhi, phi = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", hi_a, quiet=True)
+        mlo, plo = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", lo_a, quiet=True, label="lower range model")
+        mhi, phi = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", hi_a, quiet=True, label="upper range model")
+        mark("5. train the two range models")
         ev["lo"] = ev["base"].values + plo(ev[residual_feats].astype("float32")); ev["hi"] = ev["base"].values + phi(ev[residual_feats].astype("float32"))
         ev["hi"] = np.maximum(ev["hi"], ev["lo"] + 1)
         before = ((ev["actual"] >= ev["lo"]) & (ev["actual"] <= ev["hi"])).mean()
@@ -312,6 +339,7 @@ def run_final(a, cases, arr, backend):
     if not a.no_ranges:
         (out / "eta_v2_calibration.json").write_text(json.dumps({"low_q": a.low, "high_q": a.high, "widen_s_by_stops_ahead_1_2_3to4_5plus": [round(qg[g], 1) for g in (1, 2, 3, 4)]}))
     print(f"\nSaved the models and the learned tables in {out}/")
+    mark("6. report and save")
 
 
 # ---------------------------------------------------------------- leave-one-day-out
@@ -326,16 +354,18 @@ def run_cv(a, cases, arr, backend):
     rows = []
     for d in days:
         te, trn = cases[cases["day"] == d], cases[cases["day"] != d]
+        note(f"day {len(rows) + 1}/{len(days)}: learning from the other days ...")
         L = learn(trn, arr[day_of(arr["arrive_ts"]) != d], arr)
         trn = trn.sample(min(len(trn), a.max_train), random_state=0)
         va = trn.sample(frac=0.1, random_state=1); tr2 = trn.drop(va.index)
         tr2, va, te = add_feats(tr2, L), add_feats(va, L), add_feats(te, L)
-        m, pr = fit_model(tr2[FEATURES].astype("float32"), to_target(tr2, a.target), va[FEATURES].astype("float32"), to_target(va, a.target), backend, quiet=True)
+        m, pr = fit_model(tr2[FEATURES].astype("float32"), to_target(tr2, a.target), va[FEATURES].astype("float32"), to_target(va, a.target), backend, quiet=True, label=f"day {len(rows) + 1}/{len(days)} model")
         ai = from_pred(te, pr(te[FEATURES].astype("float32")), a.target)
         res = dict(ai=metrics(ai, te["actual"].values)["mae"], ht=metrics(te["base"].values, te["actual"].values)["mae"],
                    h=metrics(te["hist_eta"].fillna(te["eta_route"]).values, te["actual"].values)["mae"], rt=metrics(te["eta_route"].values, te["actual"].values)["mae"])
         best = min(res["ht"], res["h"], res["rt"])
         rows.append((d, len(te), res, best))
+        mark(f"   day {len(rows)}/{len(days)}")
         print(f"   {pd.to_datetime(d * 86400, unit='s'):%a %d %b}  {len(te):>9,}{res['ai']:>7.0f} s{res['ht']:>16.0f} s{res['h']:>10.0f} s{res['rt']:>13.0f} s{100 * (best - res['ai']) / best:>22.0f}%")
     gains = [100 * (b - r["ai"]) / b for _, _, r, b in rows]
     print(f"\n   average gain of the AI model over the best simple rule: {np.mean(gains):.0f}% (best day {max(gains):.0f}%, worst day {min(gains):.0f}%)")
@@ -352,11 +382,14 @@ def main():
     ap.add_argument("--mode", choices=["final", "cv"], default="final"); ap.add_argument("--target", choices=["residual", "ratio", "raw"], default="residual")
     ap.add_argument("--no-ablation", action="store_true"); ap.add_argument("--no-ranges", action="store_true")
     ap.add_argument("--low", type=float, default=0.1); ap.add_argument("--high", type=float, default=0.9); ap.add_argument("--out", default="models")
+    add_run_args(ap)
     a = ap.parse_args()
+    setup_run(a)
     backend = pick_backend(a.backend)
     print(f"model: {'LightGBM' if backend == 'lightgbm' else 'scikit-learn HistGradientBoosting'}   target: {a.target}   mode: {a.mode}")
     cases, arr = prepare(a)
     (run_final if a.mode == "final" else run_cv)(a, cases, arr, backend)
+    print_times()
     print("\nSend this whole output back.")
 
 

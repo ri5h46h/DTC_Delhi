@@ -16,10 +16,159 @@ Output    = test errors of the model next to the simple rules, a test without th
    python train_eta.py --step 10            use every 10th ping (faster)
 Needs lightgbm (uv add lightgbm). If it is missing, scikit-learn's HistGradientBoostingRegressor is used instead.
 """
-import argparse, json, pickle
+import argparse, json, os, pickle, sys, time
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+# ---------------------------------------------------------------- run settings, live progress and timings
+# (shared with train_eta_v2.py; none of this changes the numbers of the results)
+#   --threads N : threads LightGBM may use (default 0 = LightGBM's own default = all cores, exactly as before)
+#   --cool S    : pause of S seconds after every trained model so a fanless laptop can cool down (default 0 = no pause)
+RUN = {"threads": 0, "cool": 0.0}
+_T0 = time.time()
+_MARKS, _LAST = [], [_T0]
+_LIVE = {"on": sys.stderr.isatty(), "w": 0, "last": 0.0}      # the live status line is only drawn on a screen (stderr), never mixed into the normal output
+
+
+def _dur(s):
+    s = int(round(s))
+    return f"{s} s" if s < 60 else (f"{s // 60} min {s % 60:02d} s" if s < 3600 else f"{s // 3600} h {(s % 3600) // 60:02d} min")
+
+
+def _clock():
+    s = int(time.time() - _T0)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def live(text, force=False):
+    """One status line on the screen, overwritten by the next one and removed before any normal output."""
+    if not _LIVE["on"]:
+        return
+    now = time.time()
+    if not force and now - _LIVE["last"] < 0.4:
+        return
+    _LIVE["last"] = now
+    try:
+        cols = os.get_terminal_size(sys.stderr.fileno()).columns - 1
+    except OSError:
+        cols = 100
+    text = text[:cols]
+    sys.stderr.write("\r" + text.ljust(_LIVE["w"]))
+    sys.stderr.flush()
+    _LIVE["w"] = len(text)
+
+
+def live_clear():
+    if _LIVE["on"] and _LIVE["w"]:
+        sys.stderr.write("\r" + " " * _LIVE["w"] + "\r")
+        sys.stderr.flush()
+        _LIVE["w"] = 0
+
+
+class _Out:
+    """stdout wrapper: removes the live status line before normal text is printed, so the printed result stays clean."""
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, s):
+        live_clear()
+        return self.real.write(s)
+
+    def __getattr__(self, k):
+        return getattr(self.real, k)
+
+
+def add_run_args(ap):
+    ap.add_argument("--threads", type=int, default=0, help="threads for LightGBM (default 0 = all cores, as before). A smaller number runs cooler and slower")
+    ap.add_argument("--cool", type=float, default=0.0, help="seconds to pause after every trained model so the computer can cool down (default 0)")
+
+
+def setup_run(a):
+    RUN["threads"], RUN["cool"] = a.threads, a.cool
+    if _LIVE["on"] and not isinstance(sys.stdout, _Out):
+        sys.stdout = _Out(sys.stdout)
+    if a.threads or a.cool:
+        print(f"run settings: threads {a.threads or 'all (default)'}   pause after each model {a.cool:g} s")
+
+
+class Progress:
+    """Progress of a loop: 'label: 1,200/8,400 (14%), about 20 s left'. Shown live on a screen, or every 10% when the output is a file."""
+    def __init__(self, label, total):
+        self.label, self.total, self.t0, self.next10 = label, max(1, total), time.time(), 1
+
+    def update(self, n):
+        frac = n / self.total
+        el = time.time() - self.t0
+        left = f", about {_dur(el * (1 - frac) / frac)} left" if frac > 0.02 and el > 3 else ""
+        text = f"[{_clock()}] {self.label}: {n:,}/{self.total:,} ({100 * frac:.0f}%){left}"
+        if _LIVE["on"]:
+            live(text)
+        elif frac * 10 >= self.next10:
+            self.next10 = int(frac * 10) + 1
+            print(text, file=sys.stderr)
+
+    def done(self):
+        live_clear()
+
+
+def note(text):
+    """A short live message for a step that has no loop (for example a big sort)."""
+    if _LIVE["on"]:
+        live(f"[{_clock()}] {text}", force=True)
+    else:
+        print(f"[{_clock()}] {text}", file=sys.stderr)
+
+
+def lgb_progress(label, every=100):
+    """LightGBM callback: shows tree number, validation loss, best tree so far and how close the training is to stopping. It only READS the results."""
+    t0, st = time.time(), {"best": float("inf"), "bi": 0}
+
+    def cb(env):
+        it = env.iteration + 1
+        res = env.evaluation_result_list
+        val = res[0][2] if res else float("nan")
+        if val < st["best"]:
+            st["best"], st["bi"] = val, it
+        text = (f"[{_clock()}] {label}: tree {it} | validation loss {val:.2f} | best {st['best']:.2f} at tree {st['bi']} | "
+                f"no gain for {it - st['bi']}/50 trees (stops at 50) | {_dur(time.time() - t0)}")
+        if _LIVE["on"]:
+            live(text)
+        elif it % every == 0:
+            print(text, file=sys.stderr)
+    cb.order = 20
+    return cb
+
+
+def cool_down(label=""):
+    s = RUN["cool"]
+    if s <= 0:
+        return
+    end = time.time() + s
+    if not _LIVE["on"]:
+        print(f"[{_clock()}] cooling down {s:g} s after {label}", file=sys.stderr)
+    while time.time() < end:
+        live(f"[{_clock()}] cooling down after {label}: {max(0, end - time.time()):.0f} s left (--cool {s:g})", force=True)
+        time.sleep(min(1.0, max(0.0, end - time.time())))
+    live_clear()
+
+
+def mark(name):
+    """Remember how long the step since the last mark took (printed as RUN TIME at the end)."""
+    now = time.time()
+    _MARKS.append((name, now - _LAST[0]))
+    _LAST[0] = now
+
+
+def print_times():
+    live_clear()
+    if not _MARKS:
+        return
+    print("\nRUN TIME (pauses from --cool are included in the model that was just trained)")
+    for n, s in _MARKS:
+        print(f"   {n:<44}{_dur(s):>14}")
+    print(f"   {'total':<44}{_dur(time.time() - _T0):>14}")
+
 
 MIN_REMAIN, MAX_REMAIN = 5, 1500
 FEATURES = ["dist", "h", "v1", "v2", "v3", "v_mean3", "standing_s", "hour", "dow", "is_weekend", "v_route", "eta_route", "hist_eta", "prog", "rep"]
@@ -33,18 +182,23 @@ def load(folder, date):
     if not files:
         raise SystemExit(f"No *_pings.csv.gz files in {folder}. Run build_arrivals.py first.")
     P, A = [], []
+    prog_ = Progress("reading the day files", len(files))
     for k, f in enumerate(files):
+        prog_.update(k)
         pg = pd.read_csv(f, dtype={"vehicle_id": str, "route_id": str})
         ar = pd.read_csv(str(f).replace("_pings", "_arrivals"), dtype={"vehicle_id": str, "route_id": str})
         if "stop_prog_m" not in ar:
             raise SystemExit("The arrivals files have no stop_prog_m column. Run:  python build_arrivals.py run --force")
         pg["run_key"] = k * 10_000_000 + pg["run_id"]; ar["run_key"] = k * 10_000_000 + ar["run_id"]
         P.append(pg); A.append(ar)
+    prog_.done()
+    note("joining the days ...")
     return pd.concat(P, ignore_index=True), pd.concat(A, ignore_index=True), files
 
 
 def ping_features(p):
     """Features that only need the pings of one run: speeds of the last intervals, standing time, hour, weekday."""
+    note("speeds of the last pings of every run ...")
     p = p.sort_values(["run_key", "ts"]).reset_index(drop=True)
     g = p.groupby("run_key")
     p["v1"] = p["calc_route_kmh"]; p["v2"] = g["calc_route_kmh"].shift(1); p["v3"] = g["calc_route_kmh"].shift(2)
@@ -65,7 +219,10 @@ def make_cases(pings, arr, step, hmax):
     P_ts, P_prog = pings["ts"].values, pings["prog"].values
     A_ts, A_sp, A_si = arr["arrive_ts"].values, arr["stop_prog_m"].values, arr["stop_idx"].values
     out = {"pi": [], "h": [], "dist": [], "actual": [], "sidx": []}
-    for key, ia in aidx.items():
+    prog_ = Progress("making cases (ping + next stops)", len(aidx))
+    for n_run, (key, ia) in enumerate(aidx.items()):
+        if n_run % 200 == 0:
+            prog_.update(n_run)
         ip = pidx.get(key)
         if ip is None or len(ip) < 3:
             continue
@@ -82,6 +239,7 @@ def make_cases(pings, arr, step, hmax):
             g = (remain >= MIN_REMAIN) & (remain <= MAX_REMAIN)
             out["pi"].append(ip[ii][g]); out["h"].append(np.full(g.sum(), h + 1)); out["dist"].append(spr[jj][g] - prog[ii][g])
             out["actual"].append(remain[g]); out["sidx"].append(sir[jj][g])
+    prog_.done()
     c = pd.DataFrame({k: np.concatenate(v) if v else np.array([]) for k, v in out.items()})
     pf = pings.iloc[c["pi"].values][["ts", "route_id", "vehicle_id", "prog", "v1", "v2", "v3", "v_mean3", "standing_s", "hour", "dow", "is_weekend", "speed_rep"]].reset_index(drop=True)
     pf = pf.rename(columns={"speed_rep": "rep"})
@@ -90,6 +248,7 @@ def make_cases(pings, arr, step, hmax):
 
 def history_tables(arr, cut, v_global):
     """Median travel time between two neighbouring stops of a route, from arrivals BEFORE the cut. Returns per route: stop idx, progress, cumulative time."""
+    note("stop-to-stop times of the training part ...")
     a = arr[arr["arrive_ts"] < cut].sort_values(["run_key", "stop_idx"])
     g = a.groupby("run_key")
     a = a.assign(next_t=g["arrive_ts"].shift(-1), next_i=g["stop_idx"].shift(-1))
@@ -99,7 +258,10 @@ def history_tables(arr, cut, v_global):
     sp = arr.groupby(["route_id", "stop_idx"])["stop_prog_m"].first().reset_index().sort_values(["route_id", "stop_idx"])
     tables = {}
     medd = med.to_dict()
-    for r, g2 in sp.groupby("route_id"):
+    prog_ = Progress("history tables per route", sp["route_id"].nunique())
+    for n_r, (r, g2) in enumerate(sp.groupby("route_id")):
+        if n_r % 50 == 0:
+            prog_.update(n_r)
         idx, prog = g2["stop_idx"].values, g2["stop_prog_m"].values
         if len(idx) < 3 or np.any(np.diff(prog) < 0):
             continue
@@ -109,6 +271,7 @@ def history_tables(arr, cut, v_global):
             if np.isnan(T[m]):
                 T[m] = (prog[m + 1] - prog[m]) / v_global                      # no data: distance / typical speed
         tables[r] = (idx, prog, np.concatenate([[0.0], np.cumsum(T)]))
+    prog_.done()
     return tables
 
 
@@ -137,20 +300,25 @@ def metrics(pred, actual):
     return dict(mae=np.nanmean(np.abs(e)), med=np.nanmedian(np.abs(e)), bias=np.nanmean(e), w60=100 * np.nanmean(np.abs(e) <= 60), w120=100 * np.nanmean(np.abs(e) <= 120))
 
 
-def fit_model(Xtr, ytr, Xva, yva, backend):
+def fit_model(Xtr, ytr, Xva, yva, backend, label="model"):
     if backend == "lightgbm":
         import lightgbm as lgb
         params = dict(objective="regression_l1", learning_rate=0.08, num_leaves=127, min_data_in_leaf=200, feature_fraction=0.9,
-                      bagging_fraction=0.8, bagging_freq=1, verbose=-1, num_threads=0)
+                      bagging_fraction=0.8, bagging_freq=1, verbose=-1, num_threads=RUN["threads"])
         dtr = lgb.Dataset(Xtr, ytr); dva = lgb.Dataset(Xva, yva, reference=dtr)
-        m = lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva], callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)])
+        m = lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva], callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0), lgb_progress(label)])
+        live_clear()
         print(f"      trained {m.best_iteration} trees")
+        cool_down(label)
         return m, m.predict
     from sklearn.ensemble import HistGradientBoostingRegressor
     m = HistGradientBoostingRegressor(loss="absolute_error", learning_rate=0.1, max_iter=300, max_leaf_nodes=63, min_samples_leaf=100,
                                       early_stopping=True, validation_fraction=0.1, n_iter_no_change=20, random_state=0)
+    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...")
     m.fit(Xtr, ytr)
+    live_clear()
     print(f"      trained {m.n_iter_} trees (scikit-learn)")
+    cool_down(label)
     return m, m.predict
 
 
@@ -160,7 +328,9 @@ def main():
     ap.add_argument("--step", type=int, default=6, help="use every N-th ping"); ap.add_argument("--hmax", type=int, default=6, help="stops ahead (1..N)")
     ap.add_argument("--max-train", type=int, default=1_500_000); ap.add_argument("--backend", choices=["auto", "lightgbm", "sklearn"], default="auto")
     ap.add_argument("--no-ablation", action="store_true"); ap.add_argument("--out", default="models")
+    add_run_args(ap)
     a = ap.parse_args()
+    setup_run(a)
     backend = a.backend
     if backend == "auto":
         try:
@@ -171,11 +341,13 @@ def main():
     print(f"model: {'LightGBM' if backend == 'lightgbm' else 'scikit-learn HistGradientBoosting'}")
     pings, arr, files = load(a.arrivals, a.date)
     print(f"1. LOAD      {len(files)} day(s): {len(pings):,} pings, {len(arr):,} arrivals")
+    mark("1. load the day files")
     pings = ping_features(pings)
     cases = make_cases(pings, arr, a.step, a.hmax)
     cases = cases[cases["dist"] > 0].reset_index(drop=True)
     if len(cases) < 3000:
         raise SystemExit(f"Only {len(cases):,} cases. Collect and process more data (or use a smaller --step).")
+    mark("2. speeds and cases")
     c1, c2 = cases["ts"].quantile(0.6), cases["ts"].quantile(0.8)
     tr, va, te = cases[cases["ts"] < c1], cases[(cases["ts"] >= c1) & (cases["ts"] < c2)], cases[cases["ts"] >= c2]
     print(f"2. CASES     {len(cases):,} cases (a ping + one of the next 1-{a.hmax} stops): train {len(tr):,}, validation {len(va):,}, test {len(te):,}"
@@ -184,23 +356,27 @@ def main():
     v_global = float(vt.median()); v_route = vt.groupby(tr["route_id"]).median()
     tables = history_tables(arr, c1, v_global)
     print(f"3. LEARN     typical speed {v_global:.1f} m/s ({v_global * 3.6:.0f} km/h); typical speed of {len(v_route):,} routes; stop-to-stop times of {len(tables):,} routes (training part only)")
+    mark("3. learn typical times")
     for d in (tr, va, te):
         d["v_route"] = d["route_id"].map(v_route).fillna(v_global).clip(1, 20)
         d["eta_route"] = d["dist"] / d["v_route"]
         d["hist_eta"] = hist_eta(d, tables)
+    mark("   inputs for train / validation / test")
     sub = tr.sample(min(len(tr), a.max_train), random_state=0) if len(tr) > a.max_train else tr
     ev = te.copy()
     ev["r_route"] = ev["eta_route"]; ev["r_hist"] = ev["hist_eta"].fillna(ev["eta_route"])
     ev["r_calc"] = ev["dist"] / (ev["v1"] / 3.6).clip(2, 14).fillna(v_global); ev["r_feed"] = ev["dist"] / ev["rep"].clip(2, 14).fillna(v_global)
     print("4. TRAIN     main model with all inputs ...")
-    model, pred = fit_model(sub[FEATURES].astype("float32"), sub["actual"], va[FEATURES].astype("float32"), va["actual"], backend)
+    model, pred = fit_model(sub[FEATURES].astype("float32"), sub["actual"], va[FEATURES].astype("float32"), va["actual"], backend, "main model")
     ev["r_model"] = pred(ev[FEATURES].astype("float32"))
+    mark("4. train main model")
     rules = [("AI model (all inputs)", "r_model")]
     if not a.no_ablation:
         f2 = [f for f in FEATURES if f != "rep"]
         print("   TRAIN     second model WITHOUT the feed number (to see if it helps) ...")
-        m2, p2 = fit_model(sub[f2].astype("float32"), sub["actual"], va[f2].astype("float32"), va["actual"], backend)
+        m2, p2 = fit_model(sub[f2].astype("float32"), sub["actual"], va[f2].astype("float32"), va["actual"], backend, "model without feed number")
         ev["r_model2"] = p2(ev[f2].astype("float32")); rules.append(("AI model without feed number", "r_model2"))
+        mark("   train model without feed number")
     rules += [("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
 
     print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
@@ -236,6 +412,8 @@ def main():
     (out / "eta_tables.pkl").write_bytes(pickle.dumps({"v_global": v_global, "v_route": v_route.to_dict(), "hist_tables": tables}))
     (out / "eta_info.json").write_text(json.dumps({"backend": backend, "features": FEATURES, "test_mean_error_s": round(float(mm), 1), "cases": len(cases)}, indent=1))
     print(f"\nSaved the model and the learned tables in {out}/")
+    mark("5. report and save")
+    print_times()
     print("\nSend this whole output back.")
 
 

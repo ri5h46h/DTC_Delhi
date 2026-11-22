@@ -26,7 +26,7 @@ import pandas as pd
 
 try:
     from train_eta import load, ping_features, make_cases, metrics
-    from train_eta import RUN, Progress, predict_progress, note, live_clear, lgb_progress, cool_down, mark, print_times, add_run_args, setup_run
+    from train_eta import RUN, Progress, predict_progress, _predict_fn, note, live_clear, lgb_progress, cool_down, mark, print_times, add_run_args, setup_run
 except ImportError:
     raise SystemExit("Keep train_eta.py in the same folder as train_eta_v2.py.")
 
@@ -186,12 +186,12 @@ def fit_model(Xtr, ytr, Xva, yva, backend, kind="l1", alpha=0.5, quiet=False, la
         if not quiet:
             print(f"      trained {m.best_iteration} trees")
         cool_down(label)
-        return m, m.predict
+        return m, _predict_fn(m)
     from sklearn.ensemble import HistGradientBoostingRegressor
     kw = dict(loss="absolute_error") if kind == "l1" else dict(loss="quantile", quantile=alpha)
     m = HistGradientBoostingRegressor(learning_rate=0.1, max_iter=300, max_leaf_nodes=63, min_samples_leaf=100, early_stopping=True,
                                       validation_fraction=0.1, n_iter_no_change=20, random_state=0, **kw)
-    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...")
+    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...", kind="train")
     m.fit(Xtr, ytr)
     live_clear()
     if not quiet:
@@ -261,7 +261,7 @@ def run_final(a, cases, arr, backend):
         train("without the recent-buses inputs", "r_ai_norecent", [f for f in FEATURES if f not in RECENT]); rules.append(("AI v2 without recent-buses inputs", "r_ai_norecent"))
     rules += [("historical x time of day", "r_hist_tod"), ("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
 
-    note("scoring the test part ...")
+    note("scoring the test part ...", kind="test")
     print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
     print(f"   {'rule':<36}{'mean error':>11}{'typical error':>14}{'bias':>9}{'within 1 min':>14}{'within 2 min':>14}")
     rows = sorted(((n, metrics(ev[c].values, ev["actual"].values)) for n, c in rules), key=lambda x: x[1]["mae"])
@@ -281,7 +281,7 @@ def run_final(a, cases, arr, backend):
         if m.sum() >= 500:
             print(f"   {name}: {int(m.sum()):,} cases   " + "   ".join(f"{n}: {np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):.0f} s" for n, c in show))
 
-    note("per-route check ...")
+    note("per-route check ...", kind="test")
     print("\nPER-ROUTE CHECK (routes with enough test cases): where is the model worse than the historical ETA?")
     ev["e_ai"] = (ev["r_ai"] - ev["actual"]).abs(); ev["e_hist"] = (ev["r_hist"] - ev["actual"]).abs()
     pr = ev.groupby("route_id").agg(n=("actual", "size"), ai=("e_ai", "mean"), hist=("e_hist", "mean"))
@@ -306,7 +306,7 @@ def run_final(a, cases, arr, backend):
         # calibration on the validation part: widen both ends by the amount that makes the range hold the real time as often as wanted
         vlo = va["base"].values + predict_progress(plo, va[residual_feats].astype("float32"), "validation part, lower range model")
         vhi = np.maximum(va["base"].values + predict_progress(phi, va[residual_feats].astype("float32"), "validation part, upper range model"), vlo + 1)
-        note("calibrating the ranges ...")
+        note("calibrating the ranges ...", kind="test")
         score = np.maximum(vlo - va["actual"].values, va["actual"].values - vhi)
         want = hi_a - lo_a
         hg = lambda h: np.where(h <= 2, h, np.where(h <= 4, 3, 4))           # groups of stops ahead: 1, 2, 3-4, 5 or more
@@ -326,7 +326,7 @@ def run_final(a, cases, arr, backend):
         print(f"   {'width (s)':<14}" + "".join(f"{np.median((ev['hi'] - ev['lo'])[m]):>11.0f}" for _, m in groups))
         models["low"], models["high"] = (mlo, residual_feats), (mhi, residual_feats)
 
-    note("what the model uses most (feature importance) ...")
+    note("what the model uses most (feature importance) ...", kind="test")
     print("\nWHAT THE MODEL USES MOST")
     if backend == "lightgbm":
         imp = dict(zip(FEATURES, main.feature_importance("gain"))); tot = sum(imp.values()) or 1

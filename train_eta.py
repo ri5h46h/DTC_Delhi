@@ -31,6 +31,40 @@ _MARKS, _LAST = [], [_T0]
 _LIVE = {"on": sys.stderr.isatty(), "w": 0, "last": 0.0}      # the live status line is only drawn on a screen (stderr), never mixed into the normal output
 
 
+_COLOR = {"out": False, "err": False}                                # colors are only used on a screen (never in a file) and can be switched off with --no-color or NO_COLOR
+_KIND = {"prep": "36", "train": "1;32", "test": "1;35", "cool": "33"}     # live line: preparing data = cyan, training = green, testing = magenta, cooling pause = yellow
+
+
+def _paint_live(text, kind):
+    """[mm:ss] in grey, the rest in the colour of the kind of work."""
+    i = text.find("] ")
+    head, rest = (text[:i + 2], text[i + 2:]) if text.startswith("[") and i > 0 else ("", text)
+    return (f"\033[2m{head}\033[0m" if head else "") + f"\033[{_KIND.get(kind, '0')}m{rest}\033[0m"
+
+
+def _paint_line(line):
+    """Colours for the printed result (only used on a screen). The text itself is never changed."""
+    t = line.strip()
+    if not t:
+        return line
+    code = None
+    if t.startswith("4. TRAIN") or t.startswith("TRAIN ") or t.startswith("trained "):
+        code = "1;32"                                                      # training = green
+    elif t[:2] in ("1.", "2.", "3.") and t[2:3] == " ":
+        code = "36"                                                        # loading / cases / learning = cyan
+    elif t.startswith("=== RESULT") or t.startswith(("BY HOW FAR", "BY WHAT THE BUS", "PER-ROUTE CHECK", "PREDICTION RANGES", "WHAT THE MODEL USES MOST")):
+        code = "1;35"                                                      # testing and results = magenta
+    elif t.startswith("-> the AI model"):
+        code = "1;32" if "lower (better)" in t else "1;31"
+    elif t.startswith("RUN TIME"):
+        code = "1;33"
+    elif t.startswith("Saved the model"):
+        code = "1;32"
+    elif t.startswith("Send this whole output"):
+        code = "2"
+    return line if code is None else f"\033[{code}m{line}\033[0m"
+
+
 def _dur(s):
     s = int(round(s))
     return f"{s} s" if s < 60 else (f"{s // 60} min {s % 60:02d} s" if s < 3600 else f"{s // 3600} h {(s % 3600) // 60:02d} min")
@@ -41,7 +75,7 @@ def _clock():
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
-def live(text, force=False):
+def live(text, force=False, kind="prep"):
     """One status line on the screen, overwritten by the next one and removed before any normal output."""
     if not _LIVE["on"]:
         return
@@ -54,7 +88,8 @@ def live(text, force=False):
     except OSError:
         cols = 100
     text = text[:cols]
-    sys.stderr.write("\r" + text.ljust(_LIVE["w"]))
+    shown = _paint_live(text, kind) if _COLOR["err"] else text
+    sys.stderr.write("\r" + shown + " " * max(0, _LIVE["w"] - len(text)))
     sys.stderr.flush()
     _LIVE["w"] = len(text)
 
@@ -73,6 +108,8 @@ class _Out:
 
     def write(self, s):
         live_clear()
+        if _COLOR["out"] and s and s != "\n":
+            s = "\n".join(_paint_line(l) for l in s.split("\n"))
         return self.real.write(s)
 
     def __getattr__(self, k):
@@ -82,11 +119,18 @@ class _Out:
 def add_run_args(ap):
     ap.add_argument("--threads", type=int, default=0, help="threads for LightGBM (default 0 = all cores, as before). A smaller number runs cooler and slower")
     ap.add_argument("--cool", type=float, default=0.0, help="seconds to pause after every trained model so the computer can cool down (default 0)")
+    ap.add_argument("--no-color", action="store_true", help="no colours on the screen (colours are also off when NO_COLOR is set or the output goes to a file)")
 
 
 def setup_run(a):
     RUN["threads"], RUN["cool"] = a.threads, a.cool
-    if _LIVE["on"] and not isinstance(sys.stdout, _Out):
+    if a.threads > 0:
+        os.environ["OMP_NUM_THREADS"] = str(a.threads)      # must be set before LightGBM / scikit-learn are loaded: keeps their OpenMP code (also the prediction) at N threads
+    ok = not a.no_color and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+    _COLOR["out"], _COLOR["err"] = ok and sys.stdout.isatty(), ok and sys.stderr.isatty()
+    if os.name == "nt" and (_COLOR["out"] or _COLOR["err"]):
+        os.system("")                                        # lets the Windows 10+ console show colours
+    if (_LIVE["on"] or _COLOR["out"]) and not isinstance(sys.stdout, _Out):
         sys.stdout = _Out(sys.stdout)
     if a.threads or a.cool:
         print(f"run settings: threads {a.threads or 'all (default)'}   pause after each model {a.cool:g} s")
@@ -94,8 +138,8 @@ def setup_run(a):
 
 class Progress:
     """Progress of a loop: 'label: 1,200/8,400 (14%), about 20 s left'. Shown live on a screen, or every 10% when the output is a file."""
-    def __init__(self, label, total):
-        self.label, self.total, self.t0, self.next10 = label, max(1, total), time.time(), 1
+    def __init__(self, label, total, kind="prep"):
+        self.label, self.total, self.t0, self.next10, self.kind = label, max(1, total), time.time(), 1, kind
 
     def update(self, n):
         frac = n / self.total
@@ -103,7 +147,7 @@ class Progress:
         left = f", about {_dur(el * (1 - frac) / frac)} left" if frac > 0.02 and el > 3 else ""
         text = f"[{_clock()}] {self.label}: {n:,}/{self.total:,} ({100 * frac:.0f}%){left}"
         if _LIVE["on"]:
-            live(text)
+            live(text, kind=self.kind)
         elif frac * 10 >= self.next10:
             self.next10 = int(frac * 10) + 1
             print(text, file=sys.stderr)
@@ -112,10 +156,10 @@ class Progress:
         live_clear()
 
 
-def note(text):
+def note(text, kind="prep"):
     """A short live message for a step that has no loop (for example a big sort)."""
     if _LIVE["on"]:
-        live(f"[{_clock()}] {text}", force=True)
+        live(f"[{_clock()}] {text}", force=True, kind=kind)
     else:
         print(f"[{_clock()}] {text}", file=sys.stderr)
 
@@ -133,7 +177,7 @@ def lgb_progress(label, every=100):
         text = (f"[{_clock()}] {label}: tree {it} | validation loss {val:.2f} | best {st['best']:.2f} at tree {st['bi']} | "
                 f"no gain for {it - st['bi']}/50 trees (stops at 50) | {_dur(time.time() - t0)}")
         if _LIVE["on"]:
-            live(text)
+            live(text, kind="train")
         elif it % every == 0:
             print(text, file=sys.stderr)
     cb.order = 20
@@ -148,7 +192,7 @@ def cool_down(label=""):
     if not _LIVE["on"]:
         print(f"[{_clock()}] cooling down {s:g} s after {label}", file=sys.stderr)
     while time.time() < end:
-        live(f"[{_clock()}] cooling down after {label}: {max(0, end - time.time()):.0f} s left (--cool {s:g})", force=True)
+        live(f"[{_clock()}] cooling down after {label}: {max(0, end - time.time()):.0f} s left (--cool {s:g})", force=True, kind="cool")
         time.sleep(min(1.0, max(0.0, end - time.time())))
     live_clear()
 
@@ -156,9 +200,9 @@ def cool_down(label=""):
 def predict_progress(pr, X, label, chunk=100_000):
     """Same predictions as pr(X), made in chunks so the progress can be shown (every row is predicted on its own, so the numbers are identical)."""
     if len(X) <= chunk:
-        note(f"predicting {label} ({len(X):,} cases) ...")
+        note(f"predicting {label} ({len(X):,} cases) ...", kind="test")
         return pr(X)
-    prog_ = Progress(f"predicting {label}", len(X))
+    prog_ = Progress(f"predicting {label}", len(X), kind="test")
     out = []
     for i in range(0, len(X), chunk):
         prog_.update(i)
@@ -314,6 +358,13 @@ def metrics(pred, actual):
     return dict(mae=np.nanmean(np.abs(e)), med=np.nanmedian(np.abs(e)), bias=np.nanmean(e), w60=100 * np.nanmean(np.abs(e) <= 60), w120=100 * np.nanmean(np.abs(e) <= 120))
 
 
+def _predict_fn(m):
+    """The predict function of a LightGBM model. With --threads N it also uses N threads (the numbers are the same, only the speed differs)."""
+    if RUN["threads"] > 0:
+        return lambda X: m.predict(X, num_threads=RUN["threads"])
+    return m.predict
+
+
 def fit_model(Xtr, ytr, Xva, yva, backend, label="model"):
     if backend == "lightgbm":
         import lightgbm as lgb
@@ -324,11 +375,11 @@ def fit_model(Xtr, ytr, Xva, yva, backend, label="model"):
         live_clear()
         print(f"      trained {m.best_iteration} trees")
         cool_down(label)
-        return m, m.predict
+        return m, _predict_fn(m)
     from sklearn.ensemble import HistGradientBoostingRegressor
     m = HistGradientBoostingRegressor(loss="absolute_error", learning_rate=0.1, max_iter=300, max_leaf_nodes=63, min_samples_leaf=100,
                                       early_stopping=True, validation_fraction=0.1, n_iter_no_change=20, random_state=0)
-    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...")
+    note(f"{label}: training with scikit-learn (no live tree counter for this backend) ...", kind="train")
     m.fit(Xtr, ytr)
     live_clear()
     print(f"      trained {m.n_iter_} trees (scikit-learn)")
@@ -393,7 +444,7 @@ def main():
         mark("   train model without feed number")
     rules += [("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
 
-    note("scoring the test part ...")
+    note("scoring the test part ...", kind="test")
     print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
     print(f"   {'rule':<32}{'mean error':>11}{'typical error':>14}{'bias':>9}{'within 1 min':>14}{'within 2 min':>14}")
     rows = sorted(((n, metrics(ev[c].values, ev["actual"].values)) for n, c in rules), key=lambda x: x[1]["mae"])
@@ -412,7 +463,7 @@ def main():
     for name, m in (("standing (under 2 km/h)", ev["v1"] < 2), ("moving (5 km/h or more)", ev["v1"] >= 5)):
         if m.sum() >= 500:
             print(f"   {name}: {int(m.sum()):,} cases   " + "   ".join(f"{n}: {np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):.0f} s" for n, c in rules[:3]))
-    note("what the model uses most (feature importance) ...")
+    note("what the model uses most (feature importance) ...", kind="test")
     print("\nWHAT THE MODEL USES MOST")
     if backend == "lightgbm":
         imp = dict(zip(FEATURES, model.feature_importance("gain"))); tot = sum(imp.values()) or 1

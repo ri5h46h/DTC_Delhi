@@ -153,6 +153,20 @@ def cool_down(label=""):
     live_clear()
 
 
+def predict_progress(pr, X, label, chunk=100_000):
+    """Same predictions as pr(X), made in chunks so the progress can be shown (every row is predicted on its own, so the numbers are identical)."""
+    if len(X) <= chunk:
+        note(f"predicting {label} ({len(X):,} cases) ...")
+        return pr(X)
+    prog_ = Progress(f"predicting {label}", len(X))
+    out = []
+    for i in range(0, len(X), chunk):
+        prog_.update(i)
+        out.append(np.asarray(pr(X.iloc[i:i + chunk])))
+    prog_.done()
+    return np.concatenate(out)
+
+
 def mark(name):
     """Remember how long the step since the last mark took (printed as RUN TIME at the end)."""
     now = time.time()
@@ -368,17 +382,18 @@ def main():
     ev["r_calc"] = ev["dist"] / (ev["v1"] / 3.6).clip(2, 14).fillna(v_global); ev["r_feed"] = ev["dist"] / ev["rep"].clip(2, 14).fillna(v_global)
     print("4. TRAIN     main model with all inputs ...")
     model, pred = fit_model(sub[FEATURES].astype("float32"), sub["actual"], va[FEATURES].astype("float32"), va["actual"], backend, "main model")
-    ev["r_model"] = pred(ev[FEATURES].astype("float32"))
+    ev["r_model"] = predict_progress(pred, ev[FEATURES].astype("float32"), "test part, main model")
     mark("4. train main model")
     rules = [("AI model (all inputs)", "r_model")]
     if not a.no_ablation:
         f2 = [f for f in FEATURES if f != "rep"]
         print("   TRAIN     second model WITHOUT the feed number (to see if it helps) ...")
         m2, p2 = fit_model(sub[f2].astype("float32"), sub["actual"], va[f2].astype("float32"), va["actual"], backend, "model without feed number")
-        ev["r_model2"] = p2(ev[f2].astype("float32")); rules.append(("AI model without feed number", "r_model2"))
+        ev["r_model2"] = predict_progress(p2, ev[f2].astype("float32"), "test part, model without feed number"); rules.append(("AI model without feed number", "r_model2"))
         mark("   train model without feed number")
     rules += [("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
 
+    note("scoring the test part ...")
     print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
     print(f"   {'rule':<32}{'mean error':>11}{'typical error':>14}{'bias':>9}{'within 1 min':>14}{'within 2 min':>14}")
     rows = sorted(((n, metrics(ev[c].values, ev["actual"].values)) for n, c in rules), key=lambda x: x[1]["mae"])
@@ -397,6 +412,7 @@ def main():
     for name, m in (("standing (under 2 km/h)", ev["v1"] < 2), ("moving (5 km/h or more)", ev["v1"] >= 5)):
         if m.sum() >= 500:
             print(f"   {name}: {int(m.sum()):,} cases   " + "   ".join(f"{n}: {np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):.0f} s" for n, c in rules[:3]))
+    note("what the model uses most (feature importance) ...")
     print("\nWHAT THE MODEL USES MOST")
     if backend == "lightgbm":
         imp = dict(zip(FEATURES, model.feature_importance("gain"))); tot = sum(imp.values()) or 1
@@ -407,6 +423,7 @@ def main():
         s = ev.sample(min(len(ev), 30000), random_state=0)
         r = permutation_importance(model, s[FEATURES].astype("float32"), s["actual"], n_repeats=1, random_state=0, scoring="neg_mean_absolute_error")
         for k, v in sorted(zip(FEATURES, r.importances_mean), key=lambda x: -x[1])[:10]: print(f"   {k:<14} error grows by {v:>6.1f} s if this input is shuffled")
+    note("saving the model and tables ...")
     out = Path(a.out); out.mkdir(exist_ok=True)
     (out / "eta_model.pkl").write_bytes(pickle.dumps({"backend": backend, "model": model, "features": FEATURES}))
     (out / "eta_tables.pkl").write_bytes(pickle.dumps({"v_global": v_global, "v_route": v_route.to_dict(), "hist_tables": tables}))

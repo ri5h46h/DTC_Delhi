@@ -26,7 +26,7 @@ import pandas as pd
 
 try:
     from train_eta import load, ping_features, make_cases, metrics
-    from train_eta import RUN, Progress, note, live_clear, lgb_progress, cool_down, mark, print_times, add_run_args, setup_run
+    from train_eta import RUN, Progress, predict_progress, note, live_clear, lgb_progress, cool_down, mark, print_times, add_run_args, setup_run
 except ImportError:
     raise SystemExit("Keep train_eta.py in the same folder as train_eta_v2.py.")
 
@@ -250,7 +250,7 @@ def run_final(a, cases, arr, backend):
     def train(name, col, feats, kind="l1", alpha=0.5, store=None):
         print(f"4. TRAIN     {name} ...")
         m, pr = fit_model(sub[feats].astype("float32"), to_target(sub, a.target), va[feats].astype("float32"), to_target(va, a.target), backend, kind, alpha, label=name)
-        ev[col] = from_pred(ev, pr(ev[feats].astype("float32")), a.target)
+        ev[col] = from_pred(ev, predict_progress(pr, ev[feats].astype("float32"), "test part, " + name), a.target)
         if store:
             models[store] = (m, feats)
         mark("4. train " + name)
@@ -261,6 +261,7 @@ def run_final(a, cases, arr, backend):
         train("without the recent-buses inputs", "r_ai_norecent", [f for f in FEATURES if f not in RECENT]); rules.append(("AI v2 without recent-buses inputs", "r_ai_norecent"))
     rules += [("historical x time of day", "r_hist_tod"), ("historical stop-to-stop times", "r_hist"), ("route typical speed", "r_route"), ("calculated speed", "r_calc"), ("feed number as speed", "r_feed")]
 
+    note("scoring the test part ...")
     print(f"\n=== RESULT ON THE TEST PART ({len(ev):,} cases the model never saw; error = guess minus real time) ===")
     print(f"   {'rule':<36}{'mean error':>11}{'typical error':>14}{'bias':>9}{'within 1 min':>14}{'within 2 min':>14}")
     rows = sorted(((n, metrics(ev[c].values, ev["actual"].values)) for n, c in rules), key=lambda x: x[1]["mae"])
@@ -280,6 +281,7 @@ def run_final(a, cases, arr, backend):
         if m.sum() >= 500:
             print(f"   {name}: {int(m.sum()):,} cases   " + "   ".join(f"{n}: {np.nanmean(np.abs(ev.loc[m, c] - ev.loc[m, 'actual'])):.0f} s" for n, c in show))
 
+    note("per-route check ...")
     print("\nPER-ROUTE CHECK (routes with enough test cases): where is the model worse than the historical ETA?")
     ev["e_ai"] = (ev["r_ai"] - ev["actual"]).abs(); ev["e_hist"] = (ev["r_hist"] - ev["actual"]).abs()
     pr = ev.groupby("route_id").agg(n=("actual", "size"), ai=("e_ai", "mean"), hist=("e_hist", "mean"))
@@ -297,11 +299,14 @@ def run_final(a, cases, arr, backend):
         mlo, plo = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", lo_a, quiet=True, label="lower range model")
         mhi, phi = fit_model(sub[residual_feats].astype("float32"), to_target(sub, "residual"), va[residual_feats].astype("float32"), to_target(va, "residual"), backend, "q", hi_a, quiet=True, label="upper range model")
         mark("5. train the two range models")
-        ev["lo"] = ev["base"].values + plo(ev[residual_feats].astype("float32")); ev["hi"] = ev["base"].values + phi(ev[residual_feats].astype("float32"))
+        ev["lo"] = ev["base"].values + predict_progress(plo, ev[residual_feats].astype("float32"), "test part, lower range model")
+        ev["hi"] = ev["base"].values + predict_progress(phi, ev[residual_feats].astype("float32"), "test part, upper range model")
         ev["hi"] = np.maximum(ev["hi"], ev["lo"] + 1)
         before = ((ev["actual"] >= ev["lo"]) & (ev["actual"] <= ev["hi"])).mean()
         # calibration on the validation part: widen both ends by the amount that makes the range hold the real time as often as wanted
-        vlo = va["base"].values + plo(va[residual_feats].astype("float32")); vhi = np.maximum(va["base"].values + phi(va[residual_feats].astype("float32")), vlo + 1)
+        vlo = va["base"].values + predict_progress(plo, va[residual_feats].astype("float32"), "validation part, lower range model")
+        vhi = np.maximum(va["base"].values + predict_progress(phi, va[residual_feats].astype("float32"), "validation part, upper range model"), vlo + 1)
+        note("calibrating the ranges ...")
         score = np.maximum(vlo - va["actual"].values, va["actual"].values - vhi)
         want = hi_a - lo_a
         hg = lambda h: np.where(h <= 2, h, np.where(h <= 4, 3, 4))           # groups of stops ahead: 1, 2, 3-4, 5 or more
@@ -321,6 +326,7 @@ def run_final(a, cases, arr, backend):
         print(f"   {'width (s)':<14}" + "".join(f"{np.median((ev['hi'] - ev['lo'])[m]):>11.0f}" for _, m in groups))
         models["low"], models["high"] = (mlo, residual_feats), (mhi, residual_feats)
 
+    note("what the model uses most (feature importance) ...")
     print("\nWHAT THE MODEL USES MOST")
     if backend == "lightgbm":
         imp = dict(zip(FEATURES, main.feature_importance("gain"))); tot = sum(imp.values()) or 1
@@ -332,6 +338,7 @@ def run_final(a, cases, arr, backend):
         r = permutation_importance(main, s[FEATURES].astype("float32"), to_target(s, a.target), n_repeats=1, random_state=0, scoring="neg_mean_absolute_error")
         for k, v in sorted(zip(FEATURES, r.importances_mean), key=lambda x: -x[1])[:10]:
             print(f"   {k:<14} error grows by {v:>6.1f} s if this input is shuffled")
+    note("saving the models and tables ...")
     out = Path(a.out); out.mkdir(exist_ok=True)
     (out / "eta_v2_models.pkl").write_bytes(pickle.dumps({"backend": backend, "target": a.target, "models": {k: v[0] for k, v in models.items()}, "features": {k: v[1] for k, v in models.items()}}))
     (out / "eta_v2_tables.pkl").write_bytes(pickle.dumps({"v_global": L.v_global, "v_route": L.v_route, "med": L.med, "tables": L.tables, "tod": L.tod}))
@@ -360,7 +367,7 @@ def run_cv(a, cases, arr, backend):
         va = trn.sample(frac=0.1, random_state=1); tr2 = trn.drop(va.index)
         tr2, va, te = add_feats(tr2, L), add_feats(va, L), add_feats(te, L)
         m, pr = fit_model(tr2[FEATURES].astype("float32"), to_target(tr2, a.target), va[FEATURES].astype("float32"), to_target(va, a.target), backend, quiet=True, label=f"day {len(rows) + 1}/{len(days)} model")
-        ai = from_pred(te, pr(te[FEATURES].astype("float32")), a.target)
+        ai = from_pred(te, predict_progress(pr, te[FEATURES].astype("float32"), f"day {len(rows) + 1}/{len(days)}"), a.target)
         res = dict(ai=metrics(ai, te["actual"].values)["mae"], ht=metrics(te["base"].values, te["actual"].values)["mae"],
                    h=metrics(te["hist_eta"].fillna(te["eta_route"]).values, te["actual"].values)["mae"], rt=metrics(te["eta_route"].values, te["actual"].values)["mae"])
         best = min(res["ht"], res["h"], res["rt"])

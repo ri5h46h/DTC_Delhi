@@ -3,7 +3,7 @@
 Delhi Live Bus Explorer - a terminal app in the spirit of the One Delhi app.
 
   * MAP view  : live bus "bubbles" (route number) around any area, zoom/pan, route filter
-  * STOP board: pick a stop -> upcoming buses of every route with ETA
+  * STOP board: pick a stop -> upcoming buses of every route with ETA (history ETA by default, speed ETA shown beside it)
   * BUS detail: every field the OTD feed gives for a bus, plus derived values
   * FIELDS    : which fields the feed really fills (use these numbers in your report)
 
@@ -11,7 +11,7 @@ Run:   python delhi_bus_tui.py            (live, needs API key + GTFS folder)
        python delhi_bus_tui.py --demo     (fake buses, no key or files needed)
 Press ? inside the app for keys.
 """
-import argparse, curses, math, os, pickle, random, re, threading, time
+import argparse, curses, json, math, os, pickle, random, re, threading, time
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -26,6 +26,7 @@ load_dotenv()
 # ========================= CONFIG (edit these) =========================
 TSTACK_API_KEY = os.getenv("TSTACK_API_KEY")   # <-- paste your Delhi Transport Stack key (default feed)
 OTD_API_KEY = os.getenv("OTD_API_KEY")         # <-- paste your OTD Delhi key (--using-otd, and as the fallback feed)
+ETA_TABLE = "data/eta_table.csv.gz"         # typical stop-to-stop times made by build_eta_table.py (history ETA)
 GTFS_DIR = "gtfs"                        # folder with routes.txt, trips.txt, stops.txt, stop_times.txt
 TSTACK_URL = "https://dts-backend.transportstack.in/api/dataset/otd/get-file"      # key goes in the x-api-key header
 TSTACK_PARAMS = {"agency": "delhi-buses", "category": "realtime_gtfs", "filename": "VehiclePositions.pb"}
@@ -243,12 +244,45 @@ class Assign:
         self.alts = alts or [(pat, prog, perp)]          # other directions that fit equally well
 
 
+class HistTable:
+    """Typical (median) travel time between two neighbouring stops of a route_id, learned from your own collected data
+    by build_eta_table.py. The ETA of a live bus = sum of these times for the stops still ahead of it."""
+    def __init__(self, seg, v_route, v_global, info=None):
+        self.seg, self.v_route, self.v_global, self.info = seg, v_route, v_global, info or {}
+        self.routes = {k[0] for k in seg}
+
+    @classmethod
+    def load(cls, path):
+        path = Path(path)
+        df = pd.read_csv(path, dtype={"route_id": str, "from_stop": str, "to_stop": str})
+        seg = {(r, a, b): float(t) for r, a, b, t in zip(df["route_id"], df["from_stop"], df["to_stop"], df["median_s"])}
+        info = {}
+        try:
+            info = json.loads(path.with_name(path.name.replace(".csv.gz", "_info.json")).read_text())
+        except Exception:
+            pass
+        return cls(seg, info.get("v_route", {}), float(info.get("v_global", ASSUMED_SPEED)), info)
+
+    @classmethod
+    def demo(cls, static):
+        """Made-up table for --demo (distance / 5 m/s + 20 s per stop), only to try the screens."""
+        seg = {}
+        for rid, pats in static.patterns.items():
+            for p in pats:
+                for k in range(len(p.stop_ids) - 1):
+                    seg[(rid, p.stop_ids[k], p.stop_ids[k + 1])] = float(p.seglen[k] / 5.0 + 20.0)
+        return cls(seg, {}, 5.0, {"days": ["demo"]})
+
+
 class Fleet:
     def age(self, b):
         return max(0.0, time.time() - b.ts)
 
-    def __init__(self, static, source_name="tstack", source_label="Transport Stack", eta_speed="reported"):
+    def __init__(self, static, source_name="tstack", source_label="Transport Stack", eta_speed="reported", hist=None, eta_mode="speed"):
         self.static = static
+        self.hist = hist                                   # HistTable or None
+        self.eta_mode = eta_mode if hist is not None else "speed"      # "history" or "speed"
+        self._hist_cache = {}
         self.source_name, self.source_label, self.eta_speed = source_name, source_label, eta_speed
         self.buses, self.by_route, self.rows = {}, {}, []
         self.snap, self.last_ok, self.last_err, self.header_ts = 0, None, None, None
@@ -362,6 +396,35 @@ class Fleet:
                 return min(max(calc, 2.0), 14.0), "calc"
         return ASSUMED_SPEED, "assumed"
 
+    def hist_cum(self, pat):
+        """(cumulative typical time at every stop of the pattern, which sections came from data). Missing sections: distance / route's typical speed."""
+        c = self._hist_cache.get(id(pat))
+        if c is None:
+            h = self.hist
+            v = h.v_route.get(pat.route_id) or h.v_global
+            n = len(pat.stop_ids) - 1
+            T = np.empty(n); real = np.zeros(n, bool)
+            for k in range(n):
+                t = h.seg.get((pat.route_id, pat.stop_ids[k], pat.stop_ids[k + 1]))
+                if t is None:
+                    T[k] = pat.seglen[k] / v
+                else:
+                    T[k], real[k] = t, True
+            c = (np.concatenate([[0.0], np.cumsum(T)]), real)
+            self._hist_cache[id(pat)] = c
+        return c
+
+    def eta_hist(self, pat, prog, k_target, age=0.0):
+        """(ETA in seconds, share of the sections ahead that have real data) from the typical times, or None if the route is not in the table.
+        The bus is placed between its two stops by its progress, so only the rest of the current section counts. age = seconds since its last ping."""
+        if self.hist is None or pat.route_id not in self.hist.routes:
+            return None
+        C, real = self.hist_cum(pat)
+        k0 = max(0, min(int(np.searchsorted(pat.cum, prog, side="right")) - 1, len(real)))
+        eta = float(C[k_target] - np.interp(prog, pat.cum, C))
+        sect = real[k0:k_target]
+        return max(0.0, eta - age), (float(sect.mean()) if len(sect) else 1.0)
+
     def stop_board(self, stop_id):
         rows = []
         for pat, k in self.static.stop_routes.get(stop_id, []):
@@ -377,8 +440,13 @@ class Fleet:
                 rem = max(0.0, target - prog)
                 v, src = self.speed(b)
                 between = int(np.searchsorted(pat.cum, target) - np.searchsorted(pat.cum, prog))
-                eta = max(0.0, rem / v + DWELL_S * max(0, between - 1) - self.age(b))   # bus moved since its last ping
-                rows.append({"bus": b, "route": self.static.label(pat.route_id), "to": pat.headsign,
+                eta_spd = max(0.0, rem / v + DWELL_S * max(0, between - 1) - self.age(b))   # bus moved since its last ping
+                hh = self.eta_hist(pat, prog, k, self.age(b)) if self.hist is not None else None
+                if self.eta_mode == "history" and hh is not None:
+                    eta, alt, src = hh[0], eta_spd, ("history" if hh[1] >= 0.5 else "hist*")
+                else:
+                    eta, alt = eta_spd, (hh[0] if hh is not None else None)
+                rows.append({"bus": b, "route": self.static.label(pat.route_id), "to": pat.headsign, "alt": alt,
                              "eta_s": eta, "dist": rem, "speed": v * 3.6, "src": src, "real": self._kmh(self.speed_real(b)), "calc": self._kmh(self.speed_calc(b)), "conf": "dir?" if a.conf == "guess" else a.conf})
         rows.sort(key=lambda r: r["eta_s"])
         return rows
@@ -951,6 +1019,7 @@ class App:
         age = "-" if not f.last_ok else f"{time.time() - f.last_ok:.0f}s"
         txt = f" Delhi Live Bus Explorer [{f.source_label}] | buses {len(f.buses)} | updated {age} ago | zoom {ZOOMS[self.z]} m/col"
         if f.bad_snaps: txt += f" | empty feeds ignored: {f.bad_snaps}"
+        txt += f" | ETA {f.eta_mode}"
         if self.route: txt += f" | route {self.static.label(self.route)}"
         txt += extra
         scr.put(0, 0, txt.ljust(W), "hdr")
@@ -1022,6 +1091,21 @@ class App:
         self.draw_panel(scr, H, W, mh, vis)
         self.footer(scr, H, self.msg or "arrows pan | +/- zoom | b next bus | Enter bus fields | s stop board | / find stop | v find bus | r route | x clear | i fields | g Google Maps | ? help | q quit")
 
+    def next_etas(self, b, a, n=3):
+        """ETAs of the next stops of a bus: [(stop name, seconds, source, share of sections with data or None)]."""
+        f = self.fleet
+        k = min(int(np.searchsorted(a.pat.cum, a.prog - 1)), len(a.pat.names) - 1)
+        v, src = f.speed(b)
+        out = []
+        for kk in range(k, min(k + n, len(a.pat.names))):
+            hh = f.eta_hist(a.pat, a.prog, kk, f.age(b)) if f.eta_mode == "history" else None
+            if hh is not None:
+                out.append((a.pat.names[kk], hh[0], "history", hh[1]))
+            else:
+                d = max(0, a.pat.cum[kk] - a.prog)
+                out.append((a.pat.names[kk], max(0.0, d / v + DWELL_S * max(0, kk - k) - f.age(b)), src, None))
+        return out
+
     def speed_text(self, b):
         """reported + calculated speed (Transport Stack), or calculated only (OTD)."""
         calc, real = self.fleet.speed_calc(b), self.fleet.speed_real(b)
@@ -1044,17 +1128,20 @@ class App:
             scr.put(top + 1, 1, head, "bold")
             scr.link(top + 1, len(head) + 4, "[open in Google Maps]", maps_url(b.lat, b.lon))
             brg = f"   bearing {fmt0(b.row.get('position.bearing'))}" if b.row.get("position.bearing") is not None else ""
-            scr.put(top + 2, 1, f"pos {b.lat:.5f}, {b.lon:.5f}   {self.speed_text(b)}   ETA uses {v * 3.6:.0f} km/h ({src}){brg}   ping age {self.age(b):.0f}s")
+            nxt = self.next_etas(b, a) if a else []
+            if nxt and nxt[0][2] == "history":
+                cov = min(x[3] for x in nxt if x[3] is not None)
+                eta_txt = f"ETA from history ({100 * cov:.0f}% of the next sections have data)"
+            else:
+                eta_txt = f"ETA uses {v * 3.6:.0f} km/h ({src})"
+            scr.put(top + 2, 1, f"pos {b.lat:.5f}, {b.lon:.5f}   {self.speed_text(b)}   {eta_txt}{brg}   ping age {self.age(b):.0f}s")
             if a:
-                k = int(np.searchsorted(a.pat.cum, a.prog - 1)); k = min(k, len(a.pat.names) - 1)
                 warn = "   OFF-ROUTE" if a.perp > OFF_ROUTE_M else ""
                 scr.put(top + 3, 1, f"progress {100 * a.prog / max(a.pat.total, 1):.0f}% of route   {a.perp:.0f} m from route line   direction by: {a.conf}{warn}", "warn" if warn else "n")
                 scr.put(top + 4, 1, "next stops:", "dim")
                 x = 13
-                for kk in range(k, min(k + 3, len(a.pat.names))):
-                    d = max(0, a.pat.cum[kk] - a.prog)
-                    eta = d / v + DWELL_S * max(0, kk - k)
-                    t = f"{a.pat.names[kk][:18]} {eta / 60:.0f}min  "
+                for nm, eta, _, _ in nxt:
+                    t = f"{nm[:18]} {'due' if eta < 45 else f'{eta / 60:.0f}min'}  "
                     scr.put(top + 4, x, t); x += len(t)
             else:
                 scr.put(top + 3, 1, "not matched to a static route/trip (route_id or trip_id missing or not in GTFS)", "warn")
@@ -1076,8 +1163,9 @@ class App:
         scr.link(2, len(head) + 4, "[open in Google Maps]", maps_url(la, lo))
         scr.put(3, 1, f"{len(routes)} routes serve this stop: " + " ".join(routes[:40]), "dim")
         has_real = self.fleet.source_name != "otd"
-        RW, TW = 14, 38                      # width of the ROUTE and TOWARDS columns (text longer than this is cut)
-        scr.put(5, 1, f"{'ROUTE':<{RW}}{'TOWARDS':<{TW}}{'ETA':>8}{'DIST':>9}" + (f"{'REAL':>7}" if has_real else "") + f"{'CALC':>7}  {'ETA USES':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
+        RW, TW = 14, 32                      # width of the ROUTE and TOWARDS columns (text longer than this is cut)
+        alt_name = "SPD ETA" if self.fleet.eta_mode == "history" else "HIST ETA"
+        scr.put(5, 1, f"{'ROUTE':<{RW}}{'TOWARDS':<{TW}}{'ETA':>8}{alt_name:>9}{'DIST':>9}" + (f"{'REAL':>7}" if has_real else "") + f"{'CALC':>7}  {'ETA USES':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
         scr.put(4, 1, "speeds in km/h:  REAL = reported by the feed" + (" | " if has_real else "") + "CALC = worked out from the bus's last positions | ETA USES = which one the ETA used" if has_real else "speeds in km/h:  CALC = worked out from the bus's last positions | ETA USES = how the ETA speed was found", "dim")
         rows = self.fleet.stop_board(sid)
         if not rows:
@@ -1095,12 +1183,16 @@ class App:
             eta = r["eta_s"]
             e = "due" if eta < 45 else f"{eta / 60:.0f} min"
             f1 = lambda x: "-" if x is None else f"{x:.0f}"
-            line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 8]:<{TW}}{e:>8}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
+            al = "-" if r["alt"] is None else ("due" if r["alt"] < 45 else f"{r['alt'] / 60:.0f} min")
+            line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 8]:<{TW}}{e:>8}{al:>9}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
                     + f"{f1(r['calc']):>7}  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}")
             scr.put(6 + i, 1, line, "rev" if idx == self.board_i else self.style_for(r["route"]))
         if n_total:
             scr.put(H - 4, 1, f"Showing {self.board_scroll + 1}-{min(n_total, self.board_scroll + vis_h)} of {n_total} entries (updates live)", "bold")
-        scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping. This is the simple baseline your AI models must beat.", "dim")
+        if self.fleet.eta_mode == "history":
+            scr.put(H - 3, 1, "ETA (history) = typical past travel times of the stops still ahead of the bus, counted from its live position, minus the age of its last ping. SPD ETA = the old speed-based estimate. hist* = few sections have data.", "dim")
+        else:
+            scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping." + (" HIST ETA = from typical past travel times." if self.fleet.hist is not None else ""), "dim")
         self.footer(scr, H, "Up/Down/PgUp/PgDn choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
 
     def draw_unresolved(self, scr, H, W):
@@ -1254,11 +1346,12 @@ class App:
                "  g   open the selected bus / stop / map centre in Google Maps (default browser). Or click the underlined [open in Google Maps].", "",
                "BUBBLES  (534) = bus on route 534.  o = bus whose label did not fit.  At far zoom: * one bus, 2..9 / # = many buses.",
                "         [534] highlighted = selected bus.   + in the middle = map centre.   . = bus stop (zoom in to see)", "",
-               "STOP BOARD  upcoming buses sorted by ETA. ETA = distance along the route / speed. Direction 'by' tells how the app",
+               "STOP BOARD  upcoming buses sorted by ETA. Default ETA = typical past travel times of the stops ahead, from the bus's live position (history, needs",
+               "  data/eta_table.csv.gz made by build_eta_table.py); SPD ETA = distance / speed. --eta speed switches back. Direction 'by' tells how the app",
                "  decided the bus direction: trip (trip_id matched), bearing, history (it moved that way), nearest, guess.", "",
                "Dim bubbles = no ping for more than 5 minutes.", "",
                "SPEED  REAL = speed reported by the feed (Delhi Transport Stack only; OTD always sends 0).  CALC = distance between the bus's recent positions / time (a 20-180 s average).",
-               "       The ETA uses REAL by default (CALC when the feed has no speed), clipped to 7-50 km/h. Use --eta-speed calculated to use CALC instead.",
+               "       The speed ETA uses REAL by default (CALC when the feed has no speed), clipped to 7-50 km/h. Use --eta-speed calculated to use CALC instead.",
                "FEED   default = Delhi Transport Stack.  --using-otd = OTD as the main feed (calculated speed only).  Only ONE feed is called per refresh; the other one is a fallback",
                "       after 2 problems in a row (--no-fallback turns this off). Transport Stack pings are about 10 s older than OTD."]
         for i, t in enumerate(txt):
@@ -1307,6 +1400,8 @@ def main():
     ap.add_argument("--demo", action="store_true", help="use fake buses (no keys, no GTFS files needed)")
     ap.add_argument("--using-otd", action="store_true", help="use the OTD Delhi feed as the main feed instead of Delhi Transport Stack (calculated speed only)")
     ap.add_argument("--no-fallback", action="store_true", help="never switch to the other feed, even if the main feed has problems")
+    ap.add_argument("--eta", choices=["history", "speed"], default="history", help="ETA method: history = typical past travel times (default, needs the table), speed = distance / speed")
+    ap.add_argument("--eta-table", default=ETA_TABLE, help="table made by build_eta_table.py")
     ap.add_argument("--eta-speed", choices=["reported", "calculated"], default="reported", help="which speed the ETA uses (default: reported, calculated when the feed has none)")
     ap.add_argument("--gtfs", default=GTFS_DIR)
     ap.add_argument("--refresh", type=int, default=REFRESH_SECONDS)
@@ -1317,7 +1412,7 @@ def main():
     fleet = None
     if a.demo:
         static = demo_static(); source = DemoSource(static, with_speed=not a.using_otd)
-        fleet = Fleet(static, name, label, a.eta_speed)
+        fleet = Fleet(static, name, label, a.eta_speed, HistTable.demo(static), a.eta)
     else:
         if not key_ok(keys[name]):
             var = "OTD_API_KEY" if a.using_otd else "TSTACK_API_KEY"
@@ -1325,7 +1420,16 @@ def main():
         other = "tstack" if a.using_otd else "otd"
         use_fb = (not a.no_fallback) and key_ok(keys[other])
         static = load_static(a.gtfs)
-        fleet = Fleet(static, name, label, a.eta_speed)
+        hist = None
+        if Path(a.eta_table).exists():
+            hist = HistTable.load(a.eta_table)
+            days = hist.info.get("days", [])
+            print(f"ETA table loaded: {len(hist.seg):,} stop pairs on {len(hist.routes):,} route_ids" + (f", days {days[0]} .. {days[-1]}" if days else "") + f" (ETA method: {a.eta})")
+            time.sleep(1.0)
+        elif a.eta == "history":
+            print(f"Note: {a.eta_table} not found, so the ETA uses speed. Make it with:  python build_eta_table.py build")
+            time.sleep(1.5)
+        fleet = Fleet(static, name, label, a.eta_speed, hist, a.eta)
         source = FeedManager(name, keys, fleet, use_fb)
         if not a.no_fallback and not use_fb:
             print(f"Note: no {LABEL[other]} key pasted, so there is no fallback feed. Starting...")

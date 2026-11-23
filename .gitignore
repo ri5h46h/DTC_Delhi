@@ -17,7 +17,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# ignoring the /data dir
+# ignoring the /data and /models dir
 /models/*
 !/models/.gitkeep
 /data/*
@@ -35,3 +35,13 @@ __pycache__/
 !/data/arrivals/
 /data/arrivals/*
 !/data/arrivals/.gitkeep
+
+# ignoring the GTFS static dataset
+/gtfs/agency.txt
+/gtfs/calendar.txt
+/gtfs/feed_info.txt
+/gtfs/routes.txt
+/gtfs/shapes.txt
+/gtfs/stop_times.txt
+/gtfs/stops.txt
+/gtfs/trips.txt

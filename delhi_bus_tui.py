@@ -12,7 +12,7 @@ Run:   python delhi_bus_tui.py            (live, needs API key + GTFS folder)
        python delhi_bus_tui.py --demo     (fake buses, no key or files needed)
 Press ? inside the app for keys.
 """
-import argparse, curses, json, math, os, pickle, random, re, threading, time
+import argparse, curses, json, math, os, pickle, random, re, textwrap, threading, time
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -77,6 +77,33 @@ def fmt0(v):
 def maps_url(lat, lon):
     """Google Maps link that drops a pin on this position."""
     return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+
+
+def board_widths(W, has_real, use_ai):
+    """Widths of the ROUTE and TOWARDS columns of the stop board for a terminal W columns wide.
+    The other columns have a fixed width. At 120 columns the result is the old width (12 + 24 with the AI, 14 + 32 without).
+    A wider terminal gives the extra room to TOWARDS first (headsigns are long: half of them have 20 characters or more) and a little to ROUTE.
+    A narrower terminal takes room away from TOWARDS first, down to 12, then from ROUTE, down to 8."""
+    base_rw, base_tw = (12, 24) if use_ai else (14, 32)
+    fixed = 8 + 9 + 9 + 7 + 2 + 10 + 14 + 8 + (7 if has_real else 0) + (10 if use_ai else 0)    # ETA, other ETA, DIST, CALC, gap, ETA USES, VEHICLE, DIR, [REAL], [RANGE]
+    extra = W - fixed - (base_rw + base_tw)
+    if extra >= 0:
+        add_r = min(extra // 4, 20 - base_rw)                 # route names are short (9 of 10 have up to 12 characters)
+        add_t = min(extra - add_r, 58 - base_tw)              # 58 is enough for almost every headsign
+        return base_rw + add_r, base_tw + add_t
+    need = -extra
+    cut_t = min(need, base_tw - 12)
+    cut_r = min(need - cut_t, base_rw - 8)
+    return base_rw - cut_r, base_tw - cut_t
+
+
+def wrap_notes(text, W, max_lines=4):
+    """The explanation text under the stop board, wrapped to the terminal width (at most max_lines lines)."""
+    lines = textwrap.wrap(text, width=max(30, W - 2)) or [""]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][: max(0, max(30, W - 2) - 3)] + "..."
+    return lines
 
 
 def hav(lat1, lon1, lat2, lon2):
@@ -1204,8 +1231,9 @@ class App:
                 scr.put(top + 3, 1, f"progress {100 * a.prog / max(a.pat.total, 1):.0f}% of route   {a.perp:.0f} m from route line   direction by: {a.conf}{warn}", "warn" if warn else "n")
                 scr.put(top + 4, 1, "next stops:", "dim")
                 x = 13
+                nw = max(10, min(36, (W - 13) // max(1, len(nxt)) - 17))      # stop name length: 18 at 120 columns, more on a wider terminal, less on a narrow one
                 for nm, eta, _, _, rg in nxt:
-                    t = f"{nm[:18]} {'due' if eta < 45 else f'{eta / 60:.0f}min'}" + (f" ({self.fmt_range(*rg)})" if rg else "") + "  "
+                    t = f"{nm[:nw]} {'due' if eta < 45 else f'{eta / 60:.0f}min'}" + (f" ({self.fmt_range(*rg)})" if rg else "") + "  "
                     scr.put(top + 4, x, t); x += len(t)
             else:
                 scr.put(top + 3, 1, "not matched to a static route/trip (route_id or trip_id missing or not in GTFS)", "warn")
@@ -1227,11 +1255,11 @@ class App:
         scr.link(2, len(head) + 4, "[open in Google Maps]", maps_url(la, lo))
         scr.put(3, 1, f"{len(routes)} routes serve this stop: " + " ".join(routes[:40]), "dim")
         has_real = self.fleet.source_name != "otd"
-        RW, TW = 14, 32                      # width of the ROUTE and TOWARDS columns (text longer than this is cut)
         alt_name = "SPD ETA" if self.fleet.eta_mode == "history" else "HIST ETA"
         use_ai = self.fleet.ai is not None
-        if use_ai:                           # two more columns of room for RANGE
-            RW, TW, alt_name = 12, 24, "OTHER"
+        if use_ai:
+            alt_name = "OTHER"
+        RW, TW = board_widths(W, has_real, use_ai)       # width of the ROUTE and TOWARDS columns: grows or shrinks with the terminal width (text longer than this is cut)
         rng_head = f"{'RANGE min':>10}" if use_ai else ""
         scr.put(5, 1, f"{'ROUTE':<{RW}}{'TOWARDS':<{TW}}{'ETA':>8}{rng_head}{alt_name:>9}{'DIST':>9}" + (f"{'REAL':>7}" if has_real else "") + f"{'CALC':>7}  {'ETA USES':<10}{'VEHICLE':<14}{'DIR':<8}", "rev")
         scr.put(4, 1, "speeds in km/h:  REAL = reported by the feed" + (" | " if has_real else "") + "CALC = worked out from the bus's last positions | ETA USES = which one the ETA used" if has_real else "speeds in km/h:  CALC = worked out from the bus's last positions | ETA USES = how the ETA speed was found", "dim")
@@ -1240,7 +1268,8 @@ class App:
             scr.put(7, 1, "No tracked bus is approaching this stop right now (or buses cannot be matched to routes).", "warn")
         n_total = len(rows)
         self.board_sync(rows)
-        vis_h = max(1, H - 10)
+        nl = wrap_notes(self.board_notes(use_ai), W)     # explanation lines under the table (1-4 lines, depending on the width)
+        vis_h = max(1, H - 8 - len(nl))
         if self.board_i < self.board_scroll:
             self.board_scroll = self.board_i
         elif self.board_i >= self.board_scroll + vis_h:
@@ -1253,19 +1282,27 @@ class App:
             f1 = lambda x: "-" if x is None else f"{x:.0f}"
             al = "-" if r["alt"] is None else ("due" if r["alt"] < 45 else f"{r['alt'] / 60:.0f} min")
             rg = (f"{self.fmt_range(*r['rng']) if r['rng'] else '-':>10}") if use_ai else ""
-            line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 8]:<{TW}}{e:>8}{rg}{al:>9}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
+            line = (f"{str(r['route'])[:RW - 2]:<{RW}}{str(r['to'])[:TW - 2]:<{TW}}{e:>8}{rg}{al:>9}{r['dist']:>8.0f}m" + (f"{f1(r['real']):>7}" if has_real else "")
                     + f"{f1(r['calc']):>7}  {r['src']:<10}{r['bus'].key:<14}{r['conf']:<8}")
             scr.put(6 + i, 1, line, "rev" if idx == self.board_i else self.style_for(r["route"]))
         if n_total:
-            scr.put(H - 4, 1, f"Showing {self.board_scroll + 1}-{min(n_total, self.board_scroll + vis_h)} of {n_total} entries (updates live)", "bold")
-        if use_ai:
-            scr.put(H - 3, 1, "AI = machine-learning ETA (next 6 stops). RANGE = 10-90%: about 8 of 10 buses arrive inside it. OTHER = history ETA.", "dim")
-            scr.put(H - 2, 1, "No AI on a row = stop is more than 6 stops away, or the AI is still warming up (10-15 min): normal ETA used.", "dim")
-        elif self.fleet.eta_mode == "history":
-            scr.put(H - 3, 1, "ETA (history) = typical past travel times of the stops still ahead of the bus, counted from its live position, minus the age of its last ping. SPD ETA = the old speed-based estimate. hist* = few sections have data.", "dim")
-        else:
-            scr.put(H - 3, 1, "ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping." + (" HIST ETA = from typical past travel times." if self.fleet.hist is not None else ""), "dim")
+            scr.put(H - 2 - len(nl), 1, f"Showing {self.board_scroll + 1}-{min(n_total, self.board_scroll + vis_h)} of {n_total} entries (updates live)", "bold")
+        for i, t in enumerate(nl):
+            scr.put(H - 1 - len(nl) + i, 1, t, "dim")
         self.footer(scr, H, "Up/Down/PgUp/PgDn choose bus | Enter show on map | m centre map on stop | g Google Maps | f refresh | Esc back")
+
+    def board_notes(self, use_ai):
+        """Explanation shown under the stop board (one paragraph; wrap_notes cuts it to the terminal width)."""
+        f = self.fleet
+        if use_ai:
+            return ("AI = machine-learning ETA (next 6 stops). RANGE = 10-90%: about 8 of 10 buses arrive inside it. "
+                    "OTHER = the other estimate (history ETA on AI rows; on the other rows, the speed or history ETA that is not shown in ETA). "
+                    "No AI on a row = the stop is more than 6 stops away, or the AI is still warming up (a few minutes): the normal ETA is used.")
+        if f.eta_mode == "history":
+            return ("ETA (history) = typical past travel times of the stops still ahead of the bus, counted from its live position, minus the age of its last ping. "
+                    "SPD ETA = the old speed-based estimate. hist* = few sections have data.")
+        return ("ETA = remaining distance along the route / current speed + 12 s per stop - age of the last ping."
+                + (" HIST ETA = from typical past travel times." if f.hist is not None else ""))
 
     def draw_unresolved(self, scr, H, W):
         self.header(scr, W, " | UNRESOLVED BUSES")
@@ -1422,7 +1459,7 @@ class App:
                "  data/eta_table.csv.gz made by build_eta_table.py); SPD ETA = distance / speed. --eta speed switches back. Direction 'by' tells how the app",
                "  decided the bus direction: trip (trip_id matched), bearing, history (it moved that way), nearest, guess.",
                "  AI ETA (needs the models/ folder; --no-ai switches it off): shown for the next 6 stops of a bus as 'ETA' with a 10-90% RANGE; ETA USES = AI. OTHER column = history ETA.",
-               "  After starting the app the AI needs about 10-15 min of live data (header says warming up); until then the normal ETA is used.", "",
+               "  After starting the app the AI needs a few minutes of live data (100 stop-to-stop events; the header shows the count); until then the normal ETA is used.", "",
                "Dim bubbles = no ping for more than 5 minutes.", "",
                "SPEED  REAL = speed reported by the feed (Delhi Transport Stack only; OTD always sends 0).  CALC = distance between the bus's recent positions / time (a 20-180 s average).",
                "       The speed ETA uses REAL by default (CALC when the feed has no speed), clipped to 7-50 km/h. Use --eta-speed calculated to use CALC instead.",
@@ -1483,7 +1520,7 @@ def load_ai(models_dir, gtfs_dir):
     except (ImportError, SystemExit, Exception) as e:
         print(f"Note: AI ETA is off ({type(e).__name__}: {e}). Using history ETA.")
         time.sleep(2.0); return None
-    print(f"AI ETA loaded in {time.time() - t0:.0f} s. It needs about 10-15 min of live data after the start before it shows numbers (use --no-ai to switch it off).")
+    print(f"AI ETA loaded in {time.time() - t0:.0f} s. It needs a few minutes of live data after the start (100 stop-to-stop events) before it shows numbers (use --no-ai to switch it off).")
     time.sleep(1.5)
     return eng
 
